@@ -45,28 +45,48 @@ public:
     VectorClockTrivial();
     virtual ~VectorClockTrivial();
 
-    LogicalTime tick(Component component, uint64_t nTicks) override;
-    void tickTo(Component component, LogicalTime newTime) override;
+private:
+    // VectorClock methods implementation
 
-protected:
-    bool _gossipOutInternal(OperationContext* opCtx,
-                            BSONObjBuilder* out,
-                            const LogicalTimeArray& time) const override;
-    bool _gossipOutExternal(OperationContext* opCtx,
-                            BSONObjBuilder* out,
-                            const LogicalTimeArray& time) const override;
-    LogicalTimeArray _gossipInInternal(OperationContext* opCtx,
-                                       const BSONObj& in,
-                                       bool couldBeUnauthenticated) override;
-    LogicalTimeArray _gossipInExternal(OperationContext* opCtx,
-                                       const BSONObj& in,
-                                       bool couldBeUnauthenticated) override;
-    bool _permitRefreshDuringGossipOut() const override;
+    ComponentSet _gossipOutInternal() const override;
+    ComponentSet _gossipOutExternal() const override;
+
+    ComponentSet _gossipInInternal() const override;
+    ComponentSet _gossipInExternal() const override;
+
+    bool _permitRefreshDuringGossipOut() const override {
+        return false;
+    }
+
+    // VectorClockMutable methods implementation
+
+    SharedSemiFuture<void> waitForDurableConfigTime() override {
+        // VectorClockTrivial does not support persistence
+        MONGO_UNREACHABLE;
+    }
+
+    SharedSemiFuture<void> waitForDurableTopologyTime() override {
+        // VectorClockTrivial does not support persistence
+        MONGO_UNREACHABLE;
+    }
+
+    SharedSemiFuture<void> waitForDurable() override {
+        // VectorClockTrivial does not support persistence
+        MONGO_UNREACHABLE;
+    }
+
+    SharedSemiFuture<void> recover() override {
+        // VectorClockTrivial does not support persistence
+        MONGO_UNREACHABLE;
+    }
+
+    LogicalTime _tick(Component component, uint64_t nTicks) override;
+    void _tickTo(Component component, LogicalTime newTime) override;
 };
 
 const auto vectorClockTrivialDecoration = ServiceContext::declareDecoration<VectorClockTrivial>();
 
-ServiceContext::ConstructorActionRegisterer _registerer(
+ServiceContext::ConstructorActionRegisterer vectorClockTrivialRegisterer(
     "VectorClockTrivial-VectorClockRegistration",
     {},
     [](ServiceContext* service) {
@@ -79,43 +99,31 @@ VectorClockTrivial::VectorClockTrivial() = default;
 
 VectorClockTrivial::~VectorClockTrivial() = default;
 
-bool VectorClockTrivial::_gossipOutInternal(OperationContext* opCtx,
-                                            BSONObjBuilder* out,
-                                            const LogicalTimeArray& time) const {
+VectorClock::ComponentSet VectorClockTrivial::_gossipOutInternal() const {
     // Clocks are not gossipped in trivial (non-distributed) environments.
-    return false;
+    return ComponentSet{};
 }
 
-bool VectorClockTrivial::_gossipOutExternal(OperationContext* opCtx,
-                                            BSONObjBuilder* out,
-                                            const LogicalTimeArray& time) const {
+VectorClock::ComponentSet VectorClockTrivial::_gossipOutExternal() const {
     // Clocks are not gossipped in trivial (non-distributed) environments.
-    return false;
+    return ComponentSet{};
 }
 
-VectorClock::LogicalTimeArray VectorClockTrivial::_gossipInInternal(OperationContext* opCtx,
-                                                                    const BSONObj& in,
-                                                                    bool couldBeUnauthenticated) {
+VectorClock::ComponentSet VectorClockTrivial::_gossipInInternal() const {
     // Clocks are not gossipped in trivial (non-distributed) environments.
-    return {};
+    return ComponentSet{};
 }
 
-VectorClock::LogicalTimeArray VectorClockTrivial::_gossipInExternal(OperationContext* opCtx,
-                                                                    const BSONObj& in,
-                                                                    bool couldBeUnauthenticated) {
+VectorClock::ComponentSet VectorClockTrivial::_gossipInExternal() const {
     // Clocks are not gossipped in trivial (non-distributed) environments.
-    return {};
+    return ComponentSet{};
 }
 
-bool VectorClockTrivial::_permitRefreshDuringGossipOut() const {
-    return false;
-}
-
-LogicalTime VectorClockTrivial::tick(Component component, uint64_t nTicks) {
+LogicalTime VectorClockTrivial::_tick(Component component, uint64_t nTicks) {
     return _advanceComponentTimeByTicks(component, nTicks);
 }
 
-void VectorClockTrivial::tickTo(Component component, LogicalTime newTime) {
+void VectorClockTrivial::_tickTo(Component component, LogicalTime newTime) {
     _advanceComponentTimeTo(component, std::move(newTime));
 }
 

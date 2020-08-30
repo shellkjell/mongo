@@ -66,7 +66,7 @@ assert.writeError(secondary.getDB("foo").flag.insert({sentinel: 2}));
 assert(!secondary.getDB("admin").runCommand({"isMaster": 1}).ismaster);
 
 // Ensure new primary is not yet readable without slaveOk bit.
-secondary.slaveOk = false;
+secondary.setSecondaryOk(false);
 jsTestLog('New primary should not be readable yet, without slaveOk bit');
 var res = secondary.getDB("foo").runCommand({find: "foo"});
 assert.commandFailed(res);
@@ -74,16 +74,10 @@ assert.eq(ErrorCodes.NotMasterNoSlaveOk,
           res.code,
           "find failed with unexpected error code: " + tojson(res));
 // Nor should it be readable with the slaveOk bit.
-secondary.slaveOk = true;
+secondary.setSecondaryOk();
 assert.commandWorked(secondary.getDB("foo").runCommand({find: "foo"}));
 
-assert.commandFailedWithCode(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 5000,
-    }),
-    ErrorCodes.ExceededTimeLimit,
-    'replSetTest waitForDrainFinish should time out when draining is not allowed to complete');
+assert(!secondary.adminCommand({"isMaster": 1}).ismaster);
 
 // Allow draining to complete
 jsTestLog('Disabling fail point on new primary to allow draining to complete');
@@ -91,13 +85,6 @@ assert.commandWorked(
     secondary.getDB("admin").runCommand({configureFailPoint: 'rsSyncApplyStop', mode: 'off'}),
     'failed to disable fail point on new primary');
 primary = replSet.getPrimary();
-
-assert.commandWorked(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 30000,
-    }),
-    'replSetTest waitForDrainFinish should work when draining is allowed to complete');
 
 // Ensure new primary is writable
 jsTestLog('New primary should be writable after draining is complete');

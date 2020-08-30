@@ -30,7 +30,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/sbe_stage_builder_expression.h"
+#include "mongo/db/query/util/make_data_structure.h"
 
+#include "mongo/db/exec/sbe/stages/branch.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
 #include "mongo/db/exec/sbe/stages/filter.h"
 #include "mongo/db/exec/sbe/stages/limit_skip.h"
@@ -39,6 +41,7 @@
 #include "mongo/db/exec/sbe/stages/traverse.h"
 #include "mongo/db/exec/sbe/stages/union.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/expression_visitor.h"
 #include "mongo/db/pipeline/expression_walker.h"
@@ -62,11 +65,14 @@ std::pair<sbe::value::TypeTags, sbe::value::Value> convertFrom(Value val) {
 struct ExpressionVisitorContext {
     struct VarsFrame {
         std::deque<Variables::Id> variablesToBind;
-        sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> boundVariables;
+
+        // Slots that have been used to bind $let variables. This list is necessary to know which
+        // slots to remove from the environment when the $let goes out of scope.
+        std::set<sbe::value::SlotId> slotsForLetVariables;
 
         template <class... Args>
         VarsFrame(Args&&... args)
-            : variablesToBind{std::forward<Args>(args)...}, boundVariables{} {}
+            : variablesToBind{std::forward<Args>(args)...}, slotsForLetVariables{} {}
     };
 
     struct LogicalExpressionEvalFrame {
@@ -76,6 +82,15 @@ struct ExpressionVisitorContext {
         sbe::value::SlotId nextBranchResultSlot;
 
         std::vector<std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>> branches;
+
+        // When traversing the branches of a $switch expression, the in-visitor will see each branch
+        // of the $switch _twice_: once for the "case" part of the branch (the condition) and once
+        // for the "then" part (the expression that the $switch will evaluate to if the condition
+        // evaluates to true). During the first visit, we temporarily store the condition here so
+        // that it is available to use during the second visit, which constructs the completed
+        // EExpression for the branch and stores it in the 'branches' vector.
+        boost::optional<std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>>
+            switchBranchConditionalStage;
 
         LogicalExpressionEvalFrame(std::unique_ptr<sbe::PlanStage> traverseStage,
                                    const sbe::value::SlotVector& relevantSlots,
@@ -89,16 +104,81 @@ struct ExpressionVisitorContext {
                              sbe::value::SlotIdGenerator* slotIdGenerator,
                              sbe::value::FrameIdGenerator* frameIdGenerator,
                              sbe::value::SlotId rootSlot,
-                             sbe::value::SlotVector* relevantSlots)
+                             sbe::value::SlotVector* relevantSlots,
+                             sbe::RuntimeEnvironment* env)
         : traverseStage(std::move(inputStage)),
           slotIdGenerator(slotIdGenerator),
           frameIdGenerator(frameIdGenerator),
           rootSlot(rootSlot),
-          relevantSlots(relevantSlots) {}
+          relevantSlots(relevantSlots),
+          runtimeEnvironment(env) {}
 
     void ensureArity(size_t arity) {
         invariant(exprs.size() >= arity);
     }
+
+    /**
+     * Construct a UnionStage from the PlanStages in the 'branches' list and attach it to the inner
+     * side of a LoopJoinStage, which iterates over each branch of the UnionStage until it finds one
+     * that returns a result. Iteration ceases after the first branch that returns a result so that
+     * the remaining branches are "short circuited" and we don't do unnecessary work for for MQL
+     * expressions that are not evaluated.
+     */
+    void generateSubTreeForSelectiveExecution() {
+        auto& logicalExpressionEvalFrame = logicalExpressionEvalFrameStack.top();
+
+        std::vector<sbe::value::SlotVector> branchSlots;
+        std::vector<std::unique_ptr<sbe::PlanStage>> branchStages;
+        for (auto&& [slot, stage] : logicalExpressionEvalFrame.branches) {
+            branchSlots.push_back(sbe::makeSV(slot));
+            branchStages.push_back(std::move(stage));
+        }
+
+        auto unionStageResultSlot = slotIdGenerator->generate();
+        auto unionOfBranches = sbe::makeS<sbe::UnionStage>(
+            std::move(branchStages), std::move(branchSlots), sbe::makeSV(unionStageResultSlot));
+
+        // Restore 'relevantSlots' to the way it was before we started translating the logic
+        // operator.
+        *relevantSlots = std::move(logicalExpressionEvalFrame.savedRelevantSlots);
+
+        // Get a list of slots that are used by $let expressions. These slots need to be available
+        // to the inner side of the LoopJoinStage, in case any of the branches want to reference one
+        // of the variables bound by the $let.
+        sbe::value::SlotVector letBindings;
+        for (auto&& [_, slot] : environment) {
+            letBindings.push_back(slot);
+        }
+
+        // The LoopJoinStage we are creating here will not expose any of the slots from its outer
+        // side except for the ones we explicity ask for. For that reason, we maintain the
+        // 'relevantSlots' list of slots that may still be referenced above this stage. All of the
+        // slots in 'letBindings' are relevant by this definition, but we track them separately,
+        // which is why we need to add them in now.
+        auto relevantSlotsWithLetBindings(*relevantSlots);
+        relevantSlotsWithLetBindings.insert(
+            relevantSlotsWithLetBindings.end(), letBindings.begin(), letBindings.end());
+
+        // Put the union into a nested loop. The inner side of the nested loop will execute exactly
+        // once, trying each branch of the union until one of them short circuits or until it
+        // reaches the end. This process also restores the old 'traverseStage' value from before we
+        // started translating the logic operator, by placing it below the new nested loop stage.
+        auto stage = sbe::makeS<sbe::LoopJoinStage>(
+            std::move(logicalExpressionEvalFrame.savedTraverseStage),
+            sbe::makeS<sbe::LimitSkipStage>(std::move(unionOfBranches), 1, boost::none),
+            std::move(relevantSlotsWithLetBindings),
+            std::move(letBindings),
+            nullptr /* predicate */);
+
+        // We've already restored all necessary state from the top 'logicalExpressionEvalFrameStack'
+        // entry, so we are done with it.
+        logicalExpressionEvalFrameStack.pop();
+
+        // The final result of the logic operator is stored in the 'branchResultSlot' slot.
+        relevantSlots->push_back(unionStageResultSlot);
+        pushExpr(sbe::makeE<sbe::EVariable>(unionStageResultSlot), std::move(stage));
+    }
+
 
     std::unique_ptr<sbe::EExpression> popExpr() {
         auto expr = std::move(exprs.top());
@@ -150,6 +230,26 @@ struct ExpressionVisitorContext {
     }
 
     /**
+     * Temporarily reset 'traverseStage' and 'relevantSlots' so they are prepared for translating a
+     * $switch branch. They can be restored later using the 'logicalExpressionEvalFrameStack' top
+     * entry. Once it is fully constructed, this branch will evaluate to the "then" part of the
+     * branch if the condition is true or EOF otherwise. As with $and/$or branches (refer to the
+     * comment describing 'prepareToTranslateShortCircuitingBranch()'), these branches will become
+     * part of a UnionStage that executes the branches in turn until one yields a value.
+     */
+    void prepareToTranslateSwitchBranch(sbe::value::SlotId branchResultSlot) {
+        invariant(!logicalExpressionEvalFrameStack.empty());
+        logicalExpressionEvalFrameStack.top().nextBranchResultSlot = branchResultSlot;
+
+        traverseStage =
+            sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), 1, boost::none);
+
+        // Slots created in a previous branch for this $switch are not accessible to any stages in
+        // this new branch, so we clear them from the 'relevantSlots' list.
+        *relevantSlots = logicalExpressionEvalFrameStack.top().savedRelevantSlots;
+    }
+
+    /**
      * This does the same thing as 'prepareToTranslateShortCircuitingBranch' but is intended to the
      * last branch in an $and/$or, which cannot short circuit.
      */
@@ -173,51 +273,20 @@ struct ExpressionVisitorContext {
     sbe::value::FrameIdGenerator* frameIdGenerator;
     sbe::value::SlotId rootSlot;
     std::stack<std::unique_ptr<sbe::EExpression>> exprs;
+
+    // The lexical environment for the expression being traversed. A variable reference takes the
+    // form "$$variable_name" in MQL's concrete syntax and gets transformed into a numeric
+    // identifier (Variables::Id) in the AST. During this translation, we directly translate any
+    // such variable to an SBE slot using this mapping.
     std::map<Variables::Id, sbe::value::SlotId> environment;
     std::stack<VarsFrame> varsFrameStack;
+
     std::stack<LogicalExpressionEvalFrame> logicalExpressionEvalFrameStack;
     // See the comment above the generateExpression() declaration for an explanation of the
     // 'relevantSlots' list.
     sbe::value::SlotVector* relevantSlots;
+    sbe::RuntimeEnvironment* runtimeEnvironment;
 };
-
-/**
- * Generate an EExpression that converts a value (contained in a variable bound to 'branchRef') that
- * can be of any type to a Boolean value based on MQL's definition of truth for the branch of any
- * logical expression.
- */
-std::unique_ptr<sbe::EExpression> generateExpressionForLogicBranch(sbe::EVariable branchRef) {
-    // Make an expression that compares the value in 'branchRef' to the result of evaluating the
-    // 'valExpr' expression. The comparison uses cmp3w, so that can handle comparisons between
-    // values with different types.
-    auto makeNeqCheck = [&branchRef](std::unique_ptr<sbe::EExpression> valExpr) {
-        return sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::neq,
-            sbe::makeE<sbe::EPrimBinary>(
-                sbe::EPrimBinary::cmp3w, branchRef.clone(), std::move(valExpr)),
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
-    };
-
-    // If any of these are false, the branch is considered false for the purposes of the
-    // any logical expression.
-    auto checkExists = sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(branchRef.clone()));
-    auto checkNotNull = sbe::makeE<sbe::EPrimUnary>(
-        sbe::EPrimUnary::logicNot,
-        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(branchRef.clone())));
-    auto checkNotFalse =
-        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false));
-    auto checkNotZero =
-        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
-
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::logicAnd,
-        std::move(checkExists),
-        sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicAnd,
-                                     std::move(checkNotNull),
-                                     sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicAnd,
-                                                                  std::move(checkNotFalse),
-                                                                  std::move(checkNotZero))));
-}
 
 std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
     std::unique_ptr<sbe::PlanStage> inputStage,
@@ -309,8 +378,22 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateTraverse(
                                                innerBranchOutputSlot,
                                                sbe::makeSV(),
                                                nullptr,
-                                               nullptr)};
+                                               nullptr,
+                                               1)};
     }
+}
+
+/**
+ * Generates an EExpression that checks if the input expression is null or missing.
+ */
+std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::FrameId frameId,
+                                                        const sbe::value::SlotId slotId) {
+    sbe::EVariable var{frameId, slotId};
+    return sbe::makeE<sbe::EPrimBinary>(
+        sbe::EPrimBinary::logicOr,
+        sbe::makeE<sbe::EPrimUnary>(sbe::EPrimUnary::logicNot,
+                                    sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(var.clone()))),
+        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(var.clone())));
 }
 
 class ExpressionPreVisitor final : public ExpressionVisitor {
@@ -337,7 +420,9 @@ public:
     void visit(ExpressionCompare* expr) final {}
     void visit(ExpressionConcat* expr) final {}
     void visit(ExpressionConcatArrays* expr) final {}
-    void visit(ExpressionCond* expr) final {}
+    void visit(ExpressionCond* expr) final {
+        visitConditionalExpression(expr);
+    }
     void visit(ExpressionDateFromString* expr) final {}
     void visit(ExpressionDateFromParts* expr) final {}
     void visit(ExpressionDateToParts* expr) final {}
@@ -393,7 +478,9 @@ public:
     void visit(ExpressionBinarySize* expr) final {}
     void visit(ExpressionStrLenCP* expr) final {}
     void visit(ExpressionSubtract* expr) final {}
-    void visit(ExpressionSwitch* expr) final {}
+    void visit(ExpressionSwitch* expr) final {
+        visitConditionalExpression(expr);
+    }
     void visit(ExpressionToLower* expr) final {}
     void visit(ExpressionToUpper* expr) final {}
     void visit(ExpressionTrim* expr) final {}
@@ -446,6 +533,7 @@ public:
     void visit(ExpressionInternalFindElemMatch* expr) final {}
     void visit(ExpressionFunction* expr) final {}
     void visit(ExpressionRandom* expr) final {}
+    void visit(ExpressionToHashedIndexKey* expr) final {}
 
 private:
     void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
@@ -462,6 +550,18 @@ private:
             std::move(_context->traverseStage), *_context->relevantSlots, branchResultSlot);
 
         _context->prepareToTranslateShortCircuitingBranch(logicOp, branchResultSlot);
+    }
+
+    /**
+     * Handle $switch and $cond, which have different syntax but are structurally identical in the
+     * AST.
+     */
+    void visitConditionalExpression(Expression* expr) {
+        auto branchResultSlot = _context->slotIdGenerator->generate();
+        _context->logicalExpressionEvalFrameStack.emplace(
+            std::move(_context->traverseStage), *_context->relevantSlots, branchResultSlot);
+
+        _context->prepareToTranslateSwitchBranch(branchResultSlot);
     }
 
     ExpressionVisitorContext* _context;
@@ -491,7 +591,9 @@ public:
     void visit(ExpressionCompare* expr) final {}
     void visit(ExpressionConcat* expr) final {}
     void visit(ExpressionConcatArrays* expr) final {}
-    void visit(ExpressionCond* expr) final {}
+    void visit(ExpressionCond* expr) final {
+        visitConditionalExpression(expr);
+    }
     void visit(ExpressionDateFromString* expr) final {}
     void visit(ExpressionDateFromParts* expr) final {}
     void visit(ExpressionDateToParts* expr) final {}
@@ -523,24 +625,15 @@ public:
         // We create two bindings. First, the initializer result is bound to a slot when this
         // ProjectStage executes.
         auto slotToBind = _context->slotIdGenerator->generate();
-        invariant(currentFrame.boundVariables.find(slotToBind) ==
-                  currentFrame.boundVariables.end());
-        _context->ensureArity(1);
-        currentFrame.boundVariables.insert(std::make_pair(slotToBind, _context->popExpr()));
+        _context->traverseStage = sbe::makeProjectStage(
+            std::move(_context->traverseStage), slotToBind, _context->popExpr());
+        currentFrame.slotsForLetVariables.insert(slotToBind);
 
         // Second, we bind this variables AST-level name (with type Variable::Id) to the SlotId that
         // will be used for compilation and execution. Once this "stage builder" finishes, these
         // Variable::Id bindings will no longer be relevant.
         invariant(_context->environment.find(varToBind) == _context->environment.end());
         _context->environment.insert({varToBind, slotToBind});
-
-        if (currentFrame.variablesToBind.empty()) {
-            // We have traversed every variable initializer, and this is the last "infix" visit for
-            // this $let. Add the the ProjectStage that will perform the actual binding now, so that
-            // it executes before the "in" portion of the $let statement does.
-            _context->traverseStage = sbe::makeS<sbe::ProjectStage>(
-                std::move(_context->traverseStage), std::move(currentFrame.boundVariables));
-        }
     }
     void visit(ExpressionLn* expr) final {}
     void visit(ExpressionLog* expr) final {}
@@ -578,7 +671,9 @@ public:
     void visit(ExpressionBinarySize* expr) final {}
     void visit(ExpressionStrLenCP* expr) final {}
     void visit(ExpressionSubtract* expr) final {}
-    void visit(ExpressionSwitch* expr) final {}
+    void visit(ExpressionSwitch* expr) final {
+        visitConditionalExpression(expr);
+    }
     void visit(ExpressionToLower* expr) final {}
     void visit(ExpressionToUpper* expr) final {}
     void visit(ExpressionTrim* expr) final {}
@@ -631,6 +726,7 @@ public:
     void visit(ExpressionInternalFindElemMatch* expr) final {}
     void visit(ExpressionFunction* expr) final {}
     void visit(ExpressionRandom* expr) final {}
+    void visit(ExpressionToHashedIndexKey* expr) final {}
 
 private:
     void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
@@ -672,6 +768,90 @@ private:
         }
     }
 
+    /**
+     * Handle $switch and $cond, which have different syntax but are structurally identical in the
+     * AST.
+     */
+    void visitConditionalExpression(Expression* expr) {
+        invariant(_context->logicalExpressionEvalFrameStack.size() > 0);
+
+        auto& logicalExpressionEvalFrame = _context->logicalExpressionEvalFrameStack.top();
+        auto& switchBranchConditionalStage =
+            logicalExpressionEvalFrame.switchBranchConditionalStage;
+
+        if (switchBranchConditionalStage == boost::none) {
+            // Here, _context->popExpr() represents the $switch branch's "case" child.
+            auto frameId = _context->frameIdGenerator->generate();
+            auto branchExpr = generateExpressionForLogicBranch(sbe::EVariable{frameId, 0});
+            auto conditionExpr = sbe::makeE<sbe::ELocalBind>(
+                frameId, sbe::makeEs(_context->popExpr()), std::move(branchExpr));
+
+            auto conditionalEvalStage =
+                sbe::makeProjectStage(std::move(_context->traverseStage),
+                                      logicalExpressionEvalFrame.nextBranchResultSlot,
+                                      std::move(conditionExpr));
+
+            // Store this case eval stage for use when visiting the $switch branch's "then" child.
+            switchBranchConditionalStage.emplace(logicalExpressionEvalFrame.nextBranchResultSlot,
+                                                 std::move(conditionalEvalStage));
+        } else {
+            // Here, _context->popExpr() represents the $switch branch's "then" child.
+
+            // Get the "case" child to form the outer part of the Loop Join.
+            auto [conditionalEvalStageSlot, conditionalEvalStage] =
+                std::move(*switchBranchConditionalStage);
+            switchBranchConditionalStage = boost::none;
+
+            // Create the "then" child (a BranchStage) to form the inner nlj stage.
+            auto branchStageResultSlot = logicalExpressionEvalFrame.nextBranchResultSlot;
+            auto thenStageResultSlot = _context->slotIdGenerator->generate();
+            auto unusedElseStageResultSlot = _context->slotIdGenerator->generate();
+
+            // Construct a BranchStage tree that will bind the evaluated "then" expression if the
+            // "case" expression evalautes to true and will EOF otherwise.
+            auto branchStage = sbe::makeS<sbe::BranchStage>(
+                sbe::makeProjectStage(
+                    std::move(_context->traverseStage), thenStageResultSlot, _context->popExpr()),
+                sbe::makeS<sbe::LimitSkipStage>(
+                    sbe::makeProjectStage(
+                        sbe::makeS<sbe::CoScanStage>(),
+                        unusedElseStageResultSlot,
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0)),
+                    0,
+                    boost::none),
+                sbe::makeE<sbe::EVariable>(conditionalEvalStageSlot),
+                sbe::makeSV(thenStageResultSlot),
+                sbe::makeSV(unusedElseStageResultSlot),
+                sbe::makeSV(branchStageResultSlot));
+
+            // Get a list of slots that are used by $let expressions. These slots need to be
+            // available to the inner side of the LoopJoinStage, in case any of the branches want to
+            // reference one of the variables bound by the $let.
+            sbe::value::SlotVector outerCorrelated;
+            for (auto&& [_, slot] : _context->environment) {
+                outerCorrelated.push_back(slot);
+            }
+
+            // The true/false result of the condition, which is evaluated in the outer side of the
+            // LoopJoinStage, must be available to the inner side.
+            outerCorrelated.push_back(conditionalEvalStageSlot);
+
+            // Create a LoopJoinStage that will evaluate its outer child exactly once, to compute
+            // the true/false result of the branch condition, and then execute its inner child
+            // with the result of that condition bound to a correlated slot.
+            auto loopJoinStage = sbe::makeS<sbe::LoopJoinStage>(std::move(conditionalEvalStage),
+                                                                std::move(branchStage),
+                                                                outerCorrelated,
+                                                                outerCorrelated,
+                                                                nullptr /* predicate */);
+
+            logicalExpressionEvalFrame.branches.emplace_back(std::make_pair(
+                logicalExpressionEvalFrame.nextBranchResultSlot, std::move(loopJoinStage)));
+        }
+
+        _context->prepareToTranslateSwitchBranch(_context->slotIdGenerator->generate());
+    }
+
     ExpressionVisitorContext* _context;
 };
 
@@ -689,12 +869,7 @@ public:
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
-        auto checkNullOrEmpty = sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::logicOr,
-            sbe::makeE<sbe::EPrimUnary>(
-                sbe::EPrimUnary::logicNot,
-                sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(inputRef.clone()))),
-            sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(inputRef.clone())));
+        auto checkNullOrEmpty = generateNullOrMissing(frameId, 0);
 
         auto absExpr = sbe::makeE<sbe::EIf>(
             std::move(checkNullOrEmpty),
@@ -816,13 +991,306 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionCond* expr) final {
-        unsupportedExpression(expr->getOpName());
+        visitConditionalExpression(expr);
     }
     void visit(ExpressionDateFromString* expr) final {
         unsupportedExpression("$dateFromString");
     }
     void visit(ExpressionDateFromParts* expr) final {
-        unsupportedExpression("$dateFromString");
+        // This expression can carry null children depending on the set of fields provided,
+        // to compute a date from parts so we only need to pop if a child exists.
+        auto children = expr->getChildren();
+        invariant(children.size() == 11);
+
+        auto eTimezone = children[10] ? _context->popExpr() : nullptr;
+        auto eIsoDayOfWeek = children[9] ? _context->popExpr() : nullptr;
+        auto eIsoWeek = children[8] ? _context->popExpr() : nullptr;
+        auto eIsoWeekYear = children[7] ? _context->popExpr() : nullptr;
+        auto eMillisecond = children[6] ? _context->popExpr() : nullptr;
+        auto eSecond = children[5] ? _context->popExpr() : nullptr;
+        auto eMinute = children[4] ? _context->popExpr() : nullptr;
+        auto eHour = children[3] ? _context->popExpr() : nullptr;
+        auto eDay = children[2] ? _context->popExpr() : nullptr;
+        auto eMonth = children[1] ? _context->popExpr() : nullptr;
+        auto eYear = children[0] ? _context->popExpr() : nullptr;
+
+        // Save a flag to determine if we are in the case of an iso
+        // week year. Note that the agg expression parser ensures that one of date or
+        // isoWeekYear inputs are provided so we don't need to enforce that at this depth.
+        auto isIsoWeekYear = eIsoWeekYear ? true : false;
+
+        auto frameId = _context->frameIdGenerator->generate();
+        sbe::EVariable yearRef(frameId, 0);
+        sbe::EVariable monthRef(frameId, 1);
+        sbe::EVariable dayRef(frameId, 2);
+        sbe::EVariable hourRef(frameId, 3);
+        sbe::EVariable minRef(frameId, 4);
+        sbe::EVariable secRef(frameId, 5);
+        sbe::EVariable millisecRef(frameId, 6);
+        sbe::EVariable timeZoneRef(frameId, 7);
+
+        // Build a chain of nested bounds checks for each date part that is provided in the
+        // expression. We elide the checks in the case that default values are used. These bound
+        // checks are then used by folding over pairs of ite tests and else branches to implement
+        // short-circuiting in the case that checks fail. To emulate the control flow of MQL for
+        // this expression we interleave type conversion checks with time component bound checks.
+        const auto minInt16 = std::numeric_limits<int16_t>::lowest();
+        const auto maxInt16 = std::numeric_limits<int16_t>::max();
+
+        // Constructs an expression that does a bound check of var over a closed interval [lower,
+        // upper].
+        auto boundedCheck =
+            [](sbe::EExpression& var, int16_t lower, int16_t upper, const std::string& varName) {
+                str::stream errMsg;
+                if (varName == "year" || varName == "isoWeekYear") {
+                    errMsg << "'" << varName << "'"
+                           << " must evaluate to an integer in the range " << lower << " to "
+                           << upper;
+                } else {
+                    errMsg << "'" << varName << "'"
+                           << " must evaluate to a value in the range [" << lower << ", " << upper
+                           << "]";
+                }
+                return std::make_pair(
+                    sbe::makeE<sbe::EPrimBinary>(
+                        sbe::EPrimBinary::logicAnd,
+                        sbe::makeE<sbe::EPrimBinary>(
+                            sbe::EPrimBinary::greaterEq,
+                            var.clone(),
+                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, lower)),
+                        sbe::makeE<sbe::EPrimBinary>(
+                            sbe::EPrimBinary::lessEq,
+                            var.clone(),
+                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, upper))),
+                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{4848972}, errMsg));
+            };
+
+        // Here we want to validate each field that is provided as input to the agg expression. To
+        // do this we implement the following checks:
+        //
+        // 1) Check if the value in a given slot null or missing. If so bind null to l1.0, and
+        // continue to the next binding. Otherwise, do check 2 below.
+        //
+        // 2) Check if the value in a given slot is an integral int64. This test is done by
+        // computing a lossless conversion of the value in s1 to an int64. The exposed
+        // conversion function by the vm returns a value if there is no loss of precsision,
+        // otherwise it returns Nothing. In both the valid or Nothing case, we can store the result
+        // of the conversion in l2.0 of the inner let binding and test for existence. If the
+        // existence check fails we know the conversion is lossy and we can fail the query.
+        // Otherwise, the inner let evaluates to the converted value which is then bound to the
+        // outer let.
+        //
+        // Each invocation of fieldConversionBinding will produce a nested let of the form.
+        //
+        // let [l1.0 = s1] in
+        //   if (isNull(l1.0) || !exists(l1.0), null,
+        //     let [l2.0 = convert(l1.0, int)] in
+        //       if (exists(l2.0), l2.0, fail("... must evaluate to an integer")]), ...]
+        //  in ...
+        auto fieldConversionBinding = [](std::unique_ptr<sbe::EExpression> expr,
+                                         sbe::value::FrameIdGenerator* frameIdGenerator,
+                                         const std::string& varName) {
+            auto outerFrameId = frameIdGenerator->generate();
+            auto innerFrameId = frameIdGenerator->generate();
+            sbe::EVariable outerSlotRef(outerFrameId, 0);
+            sbe::EVariable convertedFieldRef(innerFrameId, 0);
+            return sbe::makeE<sbe::ELocalBind>(
+                outerFrameId,
+                sbe::makeEs(expr->clone()),
+                sbe::makeE<sbe::EIf>(
+                    sbe::makeE<sbe::EPrimBinary>(
+                        sbe::EPrimBinary::logicOr,
+                        sbe::makeE<sbe::EPrimUnary>(
+                            sbe::EPrimUnary::logicNot,
+                            sbe::makeE<sbe::EFunction>("exists",
+                                                       sbe::makeEs(outerSlotRef.clone()))),
+                        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(outerSlotRef.clone()))),
+                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
+                    sbe::makeE<sbe::ELocalBind>(
+                        innerFrameId,
+                        sbe::makeEs(sbe::makeE<sbe::ENumericConvert>(
+                            outerSlotRef.clone(), sbe::value::TypeTags::NumberInt64)),
+                        sbe::makeE<sbe::EIf>(
+                            sbe::makeE<sbe::EFunction>("exists",
+                                                       sbe::makeEs(convertedFieldRef.clone())),
+                            convertedFieldRef.clone(),
+                            sbe::makeE<sbe::EFail>(ErrorCodes::Error{4848979},
+                                                   str::stream()
+                                                       << "'" << varName << "'"
+                                                       << " must evaluate to an integer")))));
+        };
+
+        // Build two vectors on the fly to elide bound and conversion for defaulted values.
+        std::vector<std::pair<std::unique_ptr<sbe::EExpression>, std::unique_ptr<sbe::EExpression>>>
+            boundChecks;  // checks for lower and upper bounds of date fields.
+
+        // Operands is for the outer let bindings.
+        std::vector<std::unique_ptr<sbe::EExpression>> operands;
+        if (isIsoWeekYear) {
+            if (!eIsoWeekYear) {
+                eIsoWeekYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1970);
+                operands.push_back(std::move(eIsoWeekYear));
+            } else {
+                boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "isoWeekYear"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eIsoWeekYear), _context->frameIdGenerator, "isoWeekYear"));
+            }
+            if (!eIsoWeek) {
+                eIsoWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                operands.push_back(std::move(eIsoWeek));
+            } else {
+                boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "isoWeek"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eIsoWeek), _context->frameIdGenerator, "isoWeek"));
+            }
+            if (!eIsoDayOfWeek) {
+                eIsoDayOfWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                operands.push_back(std::move(eIsoDayOfWeek));
+            } else {
+                boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "isoDayOfWeek"));
+                operands.push_back(fieldConversionBinding(
+                    std::move(eIsoDayOfWeek), _context->frameIdGenerator, "isoDayOfWeek"));
+            }
+        } else {
+            // The regular year/month/day case.
+            if (!eYear) {
+                eYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1970);
+                operands.push_back(std::move(eYear));
+            } else {
+                boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "year"));
+                operands.push_back(
+                    fieldConversionBinding(std::move(eYear), _context->frameIdGenerator, "year"));
+            }
+            if (!eMonth) {
+                eMonth = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                operands.push_back(std::move(eMonth));
+            } else {
+                boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "month"));
+                operands.push_back(
+                    fieldConversionBinding(std::move(eMonth), _context->frameIdGenerator, "month"));
+            }
+            if (!eDay) {
+                eDay = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                operands.push_back(std::move(eDay));
+            } else {
+                boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "day"));
+                operands.push_back(
+                    fieldConversionBinding(std::move(eDay), _context->frameIdGenerator, "day"));
+            }
+        }
+        if (!eHour) {
+            eHour = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            operands.push_back(std::move(eHour));
+        } else {
+            boundChecks.push_back(boundedCheck(hourRef, minInt16, maxInt16, "hour"));
+            operands.push_back(
+                fieldConversionBinding(std::move(eHour), _context->frameIdGenerator, "hour"));
+        }
+        if (!eMinute) {
+            eMinute = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            operands.push_back(std::move(eMinute));
+        } else {
+            boundChecks.push_back(boundedCheck(minRef, minInt16, maxInt16, "minute"));
+            operands.push_back(
+                fieldConversionBinding(std::move(eMinute), _context->frameIdGenerator, "minute"));
+        }
+        if (!eSecond) {
+            eSecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            operands.push_back(std::move(eSecond));
+        } else {
+            // MQL doesn't place bound restrictions on the second field, because seconds carry over
+            // to minutes and can be large ints such as 71,841,012 or even unix epochs.
+            operands.push_back(
+                fieldConversionBinding(std::move(eSecond), _context->frameIdGenerator, "second"));
+        }
+        if (!eMillisecond) {
+            eMillisecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            operands.push_back(std::move(eMillisecond));
+        } else {
+            // MQL doesn't enforce bound restrictions on millisecond fields because milliseconds
+            // carry over to seconds.
+            operands.push_back(fieldConversionBinding(
+                std::move(eMillisecond), _context->frameIdGenerator, "millisecond"));
+        }
+        if (!eTimezone) {
+            eTimezone = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::StringSmall, 0);
+            operands.push_back(std::move(eTimezone));
+        } else {
+            // Validate that eTimezone is a string.
+            auto tzFrameId = _context->frameIdGenerator->generate();
+            sbe::EVariable timezoneRef(tzFrameId, 0);
+            operands.push_back(sbe::makeE<sbe::ELocalBind>(
+                tzFrameId,
+                sbe::makeEs(std::move(eTimezone)),
+                sbe::makeE<sbe::EIf>(
+                    sbe::makeE<sbe::EFunction>("isString", sbe::makeEs(timeZoneRef.clone())),
+                    timezoneRef.clone(),
+                    sbe::makeE<sbe::EFail>(ErrorCodes::Error{4848980},
+                                           str::stream()
+                                               << "'timezone' must evaluate to a string"))));
+        }
+
+        // Make a disjunction of null checks for each date part by over this vector. These checks
+        // are necessary after the initial conversion computation because we need have the outer let
+        // binding evaluate to null if any field is null.
+        auto nullExprs =
+            make_vector<std::unique_ptr<sbe::EExpression>>(generateNullOrMissing(frameId, 7),
+                                                           generateNullOrMissing(frameId, 6),
+                                                           generateNullOrMissing(frameId, 5),
+                                                           generateNullOrMissing(frameId, 4),
+                                                           generateNullOrMissing(frameId, 3),
+                                                           generateNullOrMissing(frameId, 2),
+                                                           generateNullOrMissing(frameId, 1),
+                                                           generateNullOrMissing(frameId, 0));
+
+        using iter_t = std::vector<std::unique_ptr<sbe::EExpression>>::iterator;
+        auto checkPartsForNull =
+            std::accumulate(std::move_iterator<iter_t>(nullExprs.begin() + 1),
+                            std::move_iterator<iter_t>(nullExprs.end()),
+                            std::move(nullExprs.front()),
+                            [](auto&& acc, auto&& b) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::logicOr, std::move(acc), std::move(b));
+                            });
+
+        // Invocation of the datePartsWeekYear and dateParts functions depend on a TimeZoneDatabase
+        // for datetime computation. This global object is registered as an unowned value in the
+        // runtime environment so we pass the corresponding slot to the datePartsWeekYear and
+        // dateParts functions as a variable.
+        auto timeZoneDBSlot = _context->runtimeEnvironment->getSlot("timeZoneDB"_sd);
+        auto computeDate =
+            sbe::makeE<sbe::EFunction>(isIsoWeekYear ? "datePartsWeekYear" : "dateParts",
+                                       sbe::makeEs(sbe::makeE<sbe::EVariable>(timeZoneDBSlot),
+                                                   yearRef.clone(),
+                                                   monthRef.clone(),
+                                                   dayRef.clone(),
+                                                   hourRef.clone(),
+                                                   minRef.clone(),
+                                                   secRef.clone(),
+                                                   millisecRef.clone(),
+                                                   timeZoneRef.clone()));
+
+        using iterPair_t = std::vector<std::pair<std::unique_ptr<sbe::EExpression>,
+                                                 std::unique_ptr<sbe::EExpression>>>::iterator;
+        auto computeBoundChecks =
+            std::accumulate(std::move_iterator<iterPair_t>(boundChecks.begin()),
+                            std::move_iterator<iterPair_t>(boundChecks.end()),
+                            std::move(computeDate),
+                            [](auto&& acc, auto&& b) {
+                                return sbe::makeE<sbe::EIf>(
+                                    std::move(b.first), std::move(acc), std::move(b.second));
+                            });
+
+        // This final ite expression allows short-circuting of the null field case. If the nullish,
+        // checks pass, then we check the bounds of each field and invoke the builtins if all checks
+        // pass.
+        auto computeDateOrNull =
+            sbe::makeE<sbe::EIf>(std::move(checkPartsForNull),
+                                 sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
+                                 std::move(computeBoundChecks));
+
+        _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
+            frameId, std::move(operands), std::move(computeDateOrNull)));
     }
     void visit(ExpressionDateToParts* expr) final {
         unsupportedExpression("$dateFromString");
@@ -919,7 +1387,7 @@ public:
         // scope.
         auto it = _context->environment.begin();
         while (it != _context->environment.end()) {
-            if (currentFrame.boundVariables.count(it->first)) {
+            if (currentFrame.slotsForLetVariables.count(it->second)) {
                 it = _context->environment.erase(it);
             } else {
                 ++it;
@@ -1040,7 +1508,7 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionSwitch* expr) final {
-        unsupportedExpression("$switch");
+        visitConditionalExpression(expr);
     }
     void visit(ExpressionToLower* expr) final {
         unsupportedExpression(expr->getOpName());
@@ -1200,6 +1668,10 @@ public:
         unsupportedExpression(expr->getOpName());
     }
 
+    void visit(ExpressionToHashedIndexKey* expr) final {
+        unsupportedExpression("$toHashedIndexKey");
+    }
+
 private:
     /**
      * Shared logic for $and, $or. Converts each child into an EExpression that evaluates to Boolean
@@ -1229,7 +1701,7 @@ private:
             return;
         }
 
-        auto& LogicalExpressionEvalFrame = _context->logicalExpressionEvalFrameStack.top();
+        auto& logicalExpressionEvalFrame = _context->logicalExpressionEvalFrameStack.top();
 
         // The last branch works differently from the others. It just uses a project stage to
         // produce a true or false value for the branch result.
@@ -1241,60 +1713,42 @@ private:
         auto lastBranchResultSlot = _context->slotIdGenerator->generate();
         auto lastBranch = sbe::makeProjectStage(
             std::move(_context->traverseStage), lastBranchResultSlot, std::move(lastBranchExpr));
-        LogicalExpressionEvalFrame.branches.emplace_back(
+        logicalExpressionEvalFrame.branches.emplace_back(
             std::make_pair(lastBranchResultSlot, std::move(lastBranch)));
 
-        std::vector<sbe::value::SlotVector> branchSlots;
-        std::vector<std::unique_ptr<sbe::PlanStage>> branchStages;
-        for (auto&& [slot, stage] : LogicalExpressionEvalFrame.branches) {
-            branchSlots.push_back(sbe::makeSV(slot));
-            branchStages.push_back(std::move(stage));
-        }
+        _context->generateSubTreeForSelectiveExecution();
+    }
 
-        auto branchResultSlot = _context->slotIdGenerator->generate();
-        auto unionOfBranches = sbe::makeS<sbe::UnionStage>(
-            std::move(branchStages), std::move(branchSlots), sbe::makeSV(branchResultSlot));
+    /**
+     * Handle $switch and $cond, which have different syntax but are structurally identical in the
+     * AST.
+     */
+    void visitConditionalExpression(Expression* expr) {
+        invariant(_context->logicalExpressionEvalFrameStack.size() > 0);
+        auto& logicalExpressionEvalFrame = _context->logicalExpressionEvalFrameStack.top();
 
-        // Restore 'relevantSlots' to the way it was before we started translating the logic
-        // operator.
-        *_context->relevantSlots = std::move(LogicalExpressionEvalFrame.savedRelevantSlots);
+        // If this is not boost::none, that would mean the AST somehow had a branch with a "case"
+        // condition but without a "then" value.
+        invariant(logicalExpressionEvalFrame.switchBranchConditionalStage == boost::none);
 
-        // Get a list of slots that are used by $let expressions. These slots need to be available
-        // to the inner side of the LoopJoinStage, in case any of the branches want to reference one
-        // of the variables bound by the $let.
-        sbe::value::SlotVector letBindings;
-        for (auto&& [_, slot] : _context->environment) {
-            letBindings.push_back(slot);
-        }
+        // The default case is always the last child in the ExpressionSwitch. If it is unspecified
+        // in the user's query, it is a nullptr. In ExpressionCond, the last child is the "else"
+        // branch, and it is guaranteed not to be nullptr.
+        auto defaultExpr = expr->getChildren().back() == nullptr
+            ? sbe::makeE<sbe::EFail>(ErrorCodes::Error{4934200},
+                                     "$switch could not find a matching branch for an "
+                                     "input, and no default was specified.")
+            : this->_context->popExpr();
 
-        // The LoopJoinStage we are creating here will not expose any of the slots from its outer
-        // side except for the ones we explicity ask for. For that reason, we maintain the
-        // 'relevantSlots' list of slots that may still be referenced above this stage. All of the
-        // slots in 'letBindings' are relevant by this definition, but we track them separately,
-        // which is why we need to add them in now.
-        auto relevantSlotsWithLetBindings(*_context->relevantSlots);
-        relevantSlotsWithLetBindings.insert(
-            relevantSlotsWithLetBindings.end(), letBindings.begin(), letBindings.end());
+        auto defaultBranchStage =
+            sbe::makeProjectStage(std::move(_context->traverseStage),
+                                  logicalExpressionEvalFrame.nextBranchResultSlot,
+                                  std::move(defaultExpr));
 
-        // Put the union into a nested loop. The inner side of the nested loop will execute exactly
-        // once, trying each branch of the union until one of them short circuits or until it
-        // reaches the end. This process also restores the old 'traverseStage' value from before we
-        // started translating the logic operator, by placing it below the new nested loop stage.
-        auto stage = sbe::makeS<sbe::LoopJoinStage>(
-            std::move(LogicalExpressionEvalFrame.savedTraverseStage),
-            sbe::makeS<sbe::LimitSkipStage>(std::move(unionOfBranches), 1, boost::none),
-            std::move(relevantSlotsWithLetBindings),
-            std::move(letBindings),
-            nullptr /* predicate */);
+        logicalExpressionEvalFrame.branches.emplace_back(std::make_pair(
+            logicalExpressionEvalFrame.nextBranchResultSlot, std::move(defaultBranchStage)));
 
-        // We've already restored all necessary state from the top 'logicalExpressionEvalFrameStack'
-        // entry, so we are done with it.
-        _context->logicalExpressionEvalFrameStack.pop();
-
-        // The final true/false result of the logic operator is stored in the 'branchResultSlot'
-        // slot.
-        _context->relevantSlots->push_back(branchResultSlot);
-        _context->pushExpr(sbe::makeE<sbe::EVariable>(branchResultSlot), std::move(stage));
+        _context->generateSubTreeForSelectiveExecution();
     }
 
     void unsupportedExpression(const char* op) const {
@@ -1331,18 +1785,54 @@ private:
 };
 }  // namespace
 
+std::unique_ptr<sbe::EExpression> generateExpressionForLogicBranch(sbe::EVariable branchRef) {
+    // Make an expression that compares the value in 'branchRef' to the result of evaluating the
+    // 'valExpr' expression. The comparison uses cmp3w, so that can handle comparisons between
+    // values with different types.
+    auto makeNeqCheck = [&branchRef](std::unique_ptr<sbe::EExpression> valExpr) {
+        return sbe::makeE<sbe::EPrimBinary>(
+            sbe::EPrimBinary::neq,
+            sbe::makeE<sbe::EPrimBinary>(
+                sbe::EPrimBinary::cmp3w, branchRef.clone(), std::move(valExpr)),
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
+    };
+
+    // If any of these are false, the branch is considered false for the purposes of the
+    // any logical expression.
+    auto checkExists = sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(branchRef.clone()));
+    auto checkNotNull = sbe::makeE<sbe::EPrimUnary>(
+        sbe::EPrimUnary::logicNot,
+        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(branchRef.clone())));
+    auto checkNotFalse =
+        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false));
+    auto checkNotZero =
+        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
+
+    return sbe::makeE<sbe::EPrimBinary>(
+        sbe::EPrimBinary::logicAnd,
+        std::move(checkExists),
+        sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicAnd,
+                                     std::move(checkNotNull),
+                                     sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicAnd,
+                                                                  std::move(checkNotFalse),
+                                                                  std::move(checkNotZero))));
+}
+
 std::tuple<sbe::value::SlotId, std::unique_ptr<sbe::EExpression>, std::unique_ptr<sbe::PlanStage>>
-generateExpression(Expression* expr,
+generateExpression(OperationContext* opCtx,
+                   Expression* expr,
                    std::unique_ptr<sbe::PlanStage> stage,
                    sbe::value::SlotIdGenerator* slotIdGenerator,
                    sbe::value::FrameIdGenerator* frameIdGenerator,
                    sbe::value::SlotId rootSlot,
+                   sbe::RuntimeEnvironment* env,
                    sbe::value::SlotVector* relevantSlots) {
     auto tempRelevantSlots = sbe::makeSV(rootSlot);
     relevantSlots = relevantSlots ? relevantSlots : &tempRelevantSlots;
 
     ExpressionVisitorContext context(
-        std::move(stage), slotIdGenerator, frameIdGenerator, rootSlot, relevantSlots);
+        std::move(stage), slotIdGenerator, frameIdGenerator, rootSlot, relevantSlots, env);
+
     ExpressionPreVisitor preVisitor{&context};
     ExpressionInVisitor inVisitor{&context};
     ExpressionPostVisitor postVisitor{&context};

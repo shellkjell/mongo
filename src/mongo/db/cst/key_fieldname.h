@@ -34,15 +34,92 @@
 #include "mongo/util/printable_enum.h"
 
 #define KEYFIELDNAMES(ENUMIFY)   \
+    ENUMIFY(add)                 \
     ENUMIFY(atan2)               \
+    ENUMIFY(abs)                 \
+    ENUMIFY(ceil)                \
+    ENUMIFY(divide)              \
+    ENUMIFY(exponent)            \
+    ENUMIFY(floor)               \
+    ENUMIFY(ln)                  \
+    ENUMIFY(log)                 \
+    ENUMIFY(logten)              \
+    ENUMIFY(mod)                 \
+    ENUMIFY(multiply)            \
+    ENUMIFY(pow)                 \
+    ENUMIFY(round)               \
+    ENUMIFY(sqrt)                \
+    ENUMIFY(subtract)            \
+    ENUMIFY(trunc)               \
     ENUMIFY(id)                  \
-    ENUMIFY(project)             \
+    ENUMIFY(andExpr)             \
+    ENUMIFY(orExpr)              \
+    ENUMIFY(notExpr)             \
+    ENUMIFY(cmp)                 \
+    ENUMIFY(eq)                  \
+    ENUMIFY(gt)                  \
+    ENUMIFY(gte)                 \
+    ENUMIFY(lt)                  \
+    ENUMIFY(lte)                 \
+    ENUMIFY(ne)                  \
+    ENUMIFY(projectExclusion)    \
+    ENUMIFY(projectInclusion)    \
+    ENUMIFY(match)               \
     ENUMIFY(inhibitOptimization) \
     ENUMIFY(unionWith)           \
     ENUMIFY(collArg)             \
     ENUMIFY(pipelineArg)         \
+    ENUMIFY(sample)              \
+    ENUMIFY(sizeArg)             \
     ENUMIFY(skip)                \
-    ENUMIFY(limit)
+    ENUMIFY(limit)               \
+    ENUMIFY(constExpr)           \
+    ENUMIFY(literal)             \
+    ENUMIFY(convert)             \
+    ENUMIFY(inputArg)            \
+    ENUMIFY(toArg)               \
+    ENUMIFY(onErrorArg)          \
+    ENUMIFY(onNullArg)           \
+    ENUMIFY(toBool)              \
+    ENUMIFY(toDate)              \
+    ENUMIFY(toDecimal)           \
+    ENUMIFY(toDouble)            \
+    ENUMIFY(toInt)               \
+    ENUMIFY(toLong)              \
+    ENUMIFY(toObjectId)          \
+    ENUMIFY(toString)            \
+    ENUMIFY(type)                \
+    ENUMIFY(concat)              \
+    ENUMIFY(dateFromString)      \
+    ENUMIFY(dateToString)        \
+    ENUMIFY(formatArg)           \
+    ENUMIFY(timezoneArg)         \
+    ENUMIFY(dateStringArg)       \
+    ENUMIFY(dateArg)             \
+    ENUMIFY(regexArg)            \
+    ENUMIFY(findArg)             \
+    ENUMIFY(replacementArg)      \
+    ENUMIFY(optionsArg)          \
+    ENUMIFY(charsArg)            \
+    ENUMIFY(indexOfBytes)        \
+    ENUMIFY(indexOfCP)           \
+    ENUMIFY(ltrim)               \
+    ENUMIFY(rtrim)               \
+    ENUMIFY(trim)                \
+    ENUMIFY(regexFind)           \
+    ENUMIFY(regexFindAll)        \
+    ENUMIFY(regexMatch)          \
+    ENUMIFY(replaceOne)          \
+    ENUMIFY(replaceAll)          \
+    ENUMIFY(split)               \
+    ENUMIFY(strLenBytes)         \
+    ENUMIFY(strLenCP)            \
+    ENUMIFY(strcasecmp)          \
+    ENUMIFY(substr)              \
+    ENUMIFY(substrBytes)         \
+    ENUMIFY(substrCP)            \
+    ENUMIFY(toLower)             \
+    ENUMIFY(toUpper)
 
 MAKE_PRINTABLE_ENUM(KeyFieldname, KEYFIELDNAMES);
 MAKE_PRINTABLE_ENUM_STRING_ARRAY(key_fieldname, KeyFieldname, KEYFIELDNAMES);

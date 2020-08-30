@@ -33,6 +33,7 @@ from buildscripts.resmokelib import testing
 from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.core import process
 from buildscripts.resmokelib.core import jasper_process
+from buildscripts.resmokelib.core import redirect as redirect_lib
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
 
 _INTERNAL_OPTIONS_TITLE = "Internal Options"
@@ -105,6 +106,7 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
 
     def execute(self):
         """Execute the 'run' subcommand."""
+
         self._setup_logging()
 
         try:
@@ -297,10 +299,13 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             self._archive.exit()
 
     # pylint: disable=too-many-instance-attributes,too-many-statements,too-many-locals
-    def _setup_jasper(self):
-        """Start up the jasper process manager."""
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def _get_jasper_reqs(self):
+        """Ensure that we have all requirements for running jasper."""
+        root_dir = os.getcwd()
         proto_file = os.path.join(root_dir, "buildscripts", "resmokelib", "core", "jasper.proto")
+        if not os.path.exists(proto_file):
+            raise RuntimeError("Resmoke must be run from the root of the mongo repo.")
+
         try:
             well_known_protos_include = pkg_resources.resource_filename("grpc_tools", "_proto")
         except ImportError:
@@ -335,18 +340,12 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
         if ret != 0:
             raise RuntimeError("Failed to generated gRPC files from the jasper.proto file")
 
-        sys.path.append(os.path.dirname(proto_out))
-
-        from jasper import jasper_pb2
-        from jasper import jasper_pb2_grpc
-
-        jasper_process.Process.jasper_pb2 = jasper_pb2
-        jasper_process.Process.jasper_pb2_grpc = jasper_pb2_grpc
+        sys.path.extend([os.path.dirname(proto_out), proto_out])
 
         curator_path = "build/curator"
         if sys.platform == "win32":
             curator_path += ".exe"
-        git_hash = "d846f0c875716e9377044ab2a50542724369662a"
+        git_hash = "d11f83290729dc42138af106fe01bc0714c24a8b"
         curator_exists = os.path.isfile(curator_path)
         curator_same_version = False
         if curator_exists:
@@ -376,10 +375,25 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             with tarfile.open(mode="r|gz", fileobj=response.raw) as tf:
                 tf.extractall(path="./build/")
 
+        return curator_path
+
+    def _setup_jasper(self):
+        """Start up the jasper process manager."""
+        curator_path = self._get_jasper_reqs()
+
+        from jasper import jasper_pb2
+        from jasper import jasper_pb2_grpc
+
+        jasper_process.Process.jasper_pb2 = jasper_pb2
+        jasper_process.Process.jasper_pb2_grpc = jasper_pb2_grpc
+
         jasper_port = config.BASE_PORT - 1
         jasper_conn_str = "localhost:%d" % jasper_port
         jasper_process.Process.connection_str = jasper_conn_str
-        jasper_command = [curator_path, "jasper", "grpc", "--port", str(jasper_port)]
+        jasper_command = [
+            curator_path, "jasper", "service", "run", "rpc", "--port",
+            str(jasper_port)
+        ]
         self._jasper_server = process.Process(self._resmoke_logger, jasper_command)
         self._jasper_server.start()
 
@@ -659,7 +673,7 @@ class RunPlugin(PluginInterface):
                             help="The path to the mongod executable for resmoke.py to use.")
 
         parser.add_argument(
-            "--mongodSetParameters", dest="mongod_set_parameters",
+            "--mongodSetParameters", dest="mongod_set_parameters", action="append",
             metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
             help=("Passes one or more --setParameter options to all mongod processes"
                   " started by resmoke.py. The argument is specified as bracketed YAML -"
@@ -669,7 +683,7 @@ class RunPlugin(PluginInterface):
                             help="The path to the mongos executable for resmoke.py to use.")
 
         parser.add_argument(
-            "--mongosSetParameters", dest="mongos_set_parameters",
+            "--mongosSetParameters", dest="mongos_set_parameters", action="append",
             metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
             help=("Passes one or more --setParameter options to all mongos processes"
                   " started by resmoke.py. The argument is specified as bracketed YAML -"
@@ -804,7 +818,7 @@ class RunPlugin(PluginInterface):
             metavar="version1-version2-..-versionN",
             help="Runs the test with the provided replica set"
             " binary version configuration. Specify 'old-new' to configure a replica set with a"
-            " 'last-stable' version primary and 'latest' version secondary. For a sharded cluster"
+            " 'last-lts' version primary and 'latest' version secondary. For a sharded cluster"
             " with two shards and two replica set nodes each, specify 'old-new-old-new'.")
 
         parser.add_argument(
@@ -823,6 +837,17 @@ class RunPlugin(PluginInterface):
             "Run the tests listed in the input file. This is an alternative to passing test files as positional arguments on the command line. Each line in the file must be a path to a test file relative to the current working directory. A short-hand for `resmoke run --replay_file foo` is `resmoke run @foo`."
         )
 
+        parser.add_argument(
+            "--mrlog", action="store_const", const="mrlog", dest="mrlog", help=
+            "Pipe output through the `mrlog` binary for converting logv2 logs to human readable logs."
+        )
+
+        parser.add_argument(
+            "--userFriendlyOutput", action="store", type=str, dest="user_friendly_output",
+            metavar="FILE", help=
+            "Have resmoke redirect all output to FILE. Additionally, stdout will contain lines that typically indicate that the test is making progress, or an error has happened. If `mrlog` is in the path it will be used. `tee` and `egrep` must be in the path."
+        )
+
         internal_options = parser.add_argument_group(
             title=_INTERNAL_OPTIONS_TITLE,
             description=("Internal options for advanced users and resmoke developers."
@@ -834,7 +859,21 @@ class RunPlugin(PluginInterface):
                   " located in the resmokeconfig/suites/ directory, then the basename"
                   " without the .yml extension can be specified, e.g. 'console'."))
 
-        # Used for testing resmoke. Do not set this.
+        # Used for testing resmoke.
+        #
+        # `is_inner_level`:
+        #     Marks the resmoke process as a child of a parent resmoke process, meaning that"
+        #     it was started by a shell process which itself was started by a top-level"
+        #     resmoke process. This is used to ensure the hang-analyzer is called properly."
+        #
+        # `test_archival`:
+        #     Allows unit testing of resmoke's archival feature where we write out the names
+        #     of the files to be archived, instead of doing the actual archival, which can
+        #     be time and resource intensive.
+        #
+        # `test_analysis`:
+        #     When specified, the hang-analyzer writes out the pids it will analyze without
+        #     actually running analysis, which can be time and resource intensive.
         internal_options.add_argument("--internalParam", action="append", dest="internal_params",
                                       help=argparse.SUPPRESS)
 

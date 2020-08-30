@@ -105,6 +105,10 @@ namespace {
 
 class CmdDropDatabase : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::string help() const override {
         return "drop (delete) this database";
     }
@@ -204,6 +208,11 @@ public:
 class CmdDrop : public ErrmsgCommandDeprecated {
 public:
     CmdDrop() : ErrmsgCommandDeprecated("drop") {}
+
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -265,6 +274,10 @@ public:
 class CmdCreate : public BasicCommand {
 public:
     CmdCreate() : BasicCommand("create") {}
+
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -343,7 +356,7 @@ public:
             uassert(ErrorCodes::InvalidOptions,
                     str::stream() << "the 'temp' field is an invalid option",
                     opCtx->getClient()->isInDirectClient() ||
-                        (opCtx->getClient()->session()->getTags() |
+                        (opCtx->getClient()->session()->getTags() &
                          transport::Session::kInternalClient));
         }
 
@@ -455,7 +468,7 @@ public:
 
         const NamespaceString nss(ns);
         AutoGetCollectionForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
+        const Collection* collection = ctx.getCollection();
 
         const auto collDesc =
             CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
@@ -634,6 +647,10 @@ public:
 class CollectionModCommand : public BasicCommand {
 public:
     CollectionModCommand() : BasicCommand("collMod") {}
+
+    virtual const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;

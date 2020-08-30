@@ -63,6 +63,10 @@ class CmdCount : public BasicCommand {
 public:
     CmdCount() : BasicCommand("count") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::string help() const override {
         return "count objects in collection";
     }
@@ -134,7 +138,7 @@ public:
         boost::optional<AutoGetCollectionForReadCommand> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
         CountCommand request(NamespaceStringOrUUID(NamespaceString{}));
@@ -169,7 +173,7 @@ public:
                                 result);
         }
 
-        Collection* const collection = ctx->getCollection();
+        const Collection* const collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
@@ -204,7 +208,7 @@ public:
         boost::optional<AutoGetCollectionForReadCommand> ctx;
         ctx.emplace(opCtx,
                     CommandHelpers::parseNsOrUUID(dbname, cmdObj),
-                    AutoGetCollection::ViewMode::kViewsPermitted);
+                    AutoGetCollectionViewMode::kViewsPermitted);
         const auto& nss = ctx->getNss();
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -232,7 +236,7 @@ public:
             return true;
         }
 
-        Collection* const collection = ctx->getCollection();
+        const Collection* const collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
@@ -256,22 +260,20 @@ public:
         auto curOp = CurOp::get(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            curOp->setPlanSummary_inlock(exec->getPlanSummary());
         }
 
         exec->executePlan();
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getSummaryStats(&summaryStats);
         if (collection) {
             CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
         if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+            curOp->debug().execStats = exec->getStats();
         }
 
         // Plan is done executing. We just need to pull the count out of the root stage.

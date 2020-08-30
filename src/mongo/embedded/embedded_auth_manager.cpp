@@ -74,11 +74,13 @@ public:
         UASSERT_NOT_IMPLEMENTED;
     }
 
-    Status getRoleDescription(OperationContext*,
-                              const RoleName&,
-                              PrivilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj*) override {
+    Status rolesExist(OperationContext*, const std::vector<RoleName>&) override {
+        UASSERT_NOT_IMPLEMENTED;
+    }
+
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext*,
+                                              const std::vector<RoleName>&,
+                                              ResolveRoleOption) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -95,7 +97,7 @@ public:
                                     PrivilegeFormat,
                                     AuthenticationRestrictionsFormat,
                                     bool,
-                                    std::vector<BSONObj>*) override {
+                                    BSONArrayBuilder*) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 

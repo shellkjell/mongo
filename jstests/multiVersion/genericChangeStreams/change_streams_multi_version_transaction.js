@@ -1,33 +1,21 @@
-// Test that resume tokens from a replica set running the "last-stable" mongod can be used to resume
+// Test that resume tokens from a replica set running a downgraded mongod can be used to resume
 // a change stream after upgrading the replica set to the "latest" mongod, even when the change
 // stream includes multi-statement transactions.
 //
-// @tags: [uses_change_streams, uses_transactions, requires_replication]
+// @tags: [
+//     uses_change_streams,
+//     uses_transactions,
+//     requires_replication,
+//     requires_majority_read_concern
+// ]
 (function() {
 "use strict";
 
 load('jstests/multiVersion/libs/multi_rs.js');  // For upgradeSet.
-load("jstests/replsets/rslib.js");              // For startSetIfSupportsReadMajority.
-
-const rst = new ReplSetTest({
-    nodes: 2,
-    nodeOptions: {binVersion: "last-stable"},
-});
-
-if (!startSetIfSupportsReadMajority(rst)) {
-    jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
-    rst.stopSet();
-    return;
-}
-
-rst.initiate();
 
 const dbName = jsTestName();
 const watchedCollName = "change_stream_watched";
 const unwatchedCollName = "change_stream_unwatched";
-
-rst.getPrimary().getDB(dbName).createCollection(watchedCollName);
-rst.getPrimary().getDB(dbName).createCollection(unwatchedCollName);
 
 // Calls next() on a change stream cursor 'n' times and returns an array with the results.
 function getChangeStreamResults(cursor, n) {
@@ -104,24 +92,42 @@ const expectedChanges = [
     {operationType: "delete", documentKey: {_id: 1}},
 ];
 
-// Create the original change stream, verify it gives us the changes we expect, and verify that
-// we can correctly resume from any resume token.
-const changeStreamCursor = rst.getPrimary().getDB(dbName)[watchedCollName].watch();
-performDBOps(rst.getPrimary());
-const changeStreamDocs = getChangeStreamResults(changeStreamCursor, expectedChanges.length);
-compareChanges(expectedChanges, changeStreamDocs);
-resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+function runTest(downgradeVersion) {
+    const rst = new ReplSetTest({
+        nodes: 2,
+        nodeOptions: {binVersion: downgradeVersion},
+    });
 
-// Upgrade the replica set (while leaving featureCompatibilityVersion as it is) and verify that
-// we can correctly resume from any resume token.
-rst.upgradeSet({binVersion: "latest"});
-resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+    jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
+    rst.startSet();
+    rst.initiate();
 
-// Upgrade the featureCompatibilityVersion and verify that we can correctly resume from any
-// resume token.
-assert.commandWorked(rst.getPrimary().adminCommand({setFeatureCompatibilityVersion: latestFCV}));
-checkFCV(rst.getPrimary().getDB("admin"), latestFCV);
-resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+    rst.getPrimary().getDB(dbName).createCollection(watchedCollName);
+    rst.getPrimary().getDB(dbName).createCollection(unwatchedCollName);
 
-rst.stopSet();
+    // Create the original change stream, verify it gives us the changes we expect, and verify that
+    // we can correctly resume from any resume token.
+    const changeStreamCursor = rst.getPrimary().getDB(dbName)[watchedCollName].watch();
+    performDBOps(rst.getPrimary());
+    const changeStreamDocs = getChangeStreamResults(changeStreamCursor, expectedChanges.length);
+    compareChanges(expectedChanges, changeStreamDocs);
+    resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+
+    // Upgrade the replica set (while leaving featureCompatibilityVersion as it is) and verify that
+    // we can correctly resume from any resume token.
+    rst.upgradeSet({binVersion: "latest"});
+    resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+
+    // Upgrade the featureCompatibilityVersion and verify that we can correctly resume from any
+    // resume token.
+    assert.commandWorked(
+        rst.getPrimary().adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+    checkFCV(rst.getPrimary().getDB("admin"), latestFCV);
+    resumeChangeStreamFromEachToken(rst.getPrimary(), changeStreamDocs, expectedChanges);
+
+    rst.stopSet();
+}
+
+runTest("last-continuous");
+runTest("last-lts");
 }());

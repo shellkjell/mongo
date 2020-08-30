@@ -35,6 +35,7 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -44,12 +45,15 @@
 #include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_oplog_entry_version.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/util/embedded_builder.h"
 #include "mongo/util/str.h"
 #include "mongo/util/visit_helper.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangAfterPipelineUpdateFCVCheck);
 
 using pathsupport::EqualityMatches;
 
@@ -69,13 +73,6 @@ modifiertable::ModifierType validateMod(BSONElement mod) {
                           << typeName(mod.type()) << " instead. For example: {$mod: {<field>: ...}}"
                           << " not {" << mod << "}",
             mod.type() == BSONType::Object);
-
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "'" << mod.fieldName()
-                          << "' is empty. You must specify a field like so: "
-                             "{"
-                          << mod.fieldName() << ": {<field>: ...}}",
-            !mod.embeddedObject().isEmpty());
 
     return modType;
 }
@@ -146,6 +143,9 @@ void UpdateDriver::parse(
         uassert(4772603,
                 "arrayFilters may not be specified for delta-syle updates",
                 arrayFilters.empty());
+
+        // Delta updates should only be applied as part of oplog application.
+        invariant(_fromOplogApplication);
 
         _updateType = UpdateType::kDelta;
         _updateExecutor = std::make_unique<DeltaExecutor>(updateMod.getDiff());
@@ -240,7 +240,8 @@ Status UpdateDriver::populateDocumentWithQueryFields(const CanonicalQuery& query
     return status;
 }
 
-Status UpdateDriver::update(StringData matchedField,
+Status UpdateDriver::update(OperationContext* opCtx,
+                            StringData matchedField,
                             mutablebson::Document* doc,
                             bool validateForStorage,
                             const FieldRefSet& immutablePaths,
@@ -250,7 +251,9 @@ Status UpdateDriver::update(StringData matchedField,
                             FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = (_updateType != UpdateType::kOperator && _indexedFields != nullptr);
+    _affectIndices =
+        (_updateType == UpdateType::kReplacement || _updateType == UpdateType::kPipeline) &&
+        (_indexedFields != nullptr);
 
     _logDoc.reset();
 
@@ -265,9 +268,19 @@ Status UpdateDriver::update(StringData matchedField,
     invariant(!modifiedPaths || modifiedPaths->empty());
 
     if (_logOp && logOpRec) {
-        applyParams.logMode = internalQueryEnableLoggingV2OplogEntries.load()
+        const auto& fcv = serverGlobalParams.featureCompatibility;
+        const bool fcvAllowsV2Entries = fcv.isVersionInitialized() &&
+            fcv.getVersion() == ServerGlobalParams::FeatureCompatibility::Version::kVersion47;
+
+        applyParams.logMode = fcvAllowsV2Entries && internalQueryEnableLoggingV2OplogEntries.load()
             ? ApplyParams::LogMode::kGenerateOplogEntry
             : ApplyParams::LogMode::kGenerateOnlyV1OplogEntry;
+
+        if (MONGO_unlikely(hangAfterPipelineUpdateFCVCheck.shouldFail()) &&
+            type() == UpdateType::kPipeline) {
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangAfterPipelineUpdateFCVCheck, opCtx, "hangAfterPipelineUpdateFCVCheck");
+        }
     }
 
     invariant(_updateExecutor);

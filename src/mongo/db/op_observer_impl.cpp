@@ -40,8 +40,6 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -51,10 +49,11 @@
 #include "mongo/db/op_observer_util.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
-#include "mongo/db/repl/migrating_tenant_donor_util.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
@@ -72,14 +71,14 @@
 namespace mongo {
 using repl::MutableOplogEntry;
 using repl::OplogEntry;
+const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>
+    documentKeyDecoration =
+        OperationContext::declareDecoration<boost::optional<OpObserverImpl::DocumentKey>>();
 
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(failCollectionUpdates);
 MONGO_FAIL_POINT_DEFINE(hangAndFailUnpreparedCommitAfterReservingOplogSlot);
-
-const auto documentKeyDecoration =
-    OperationContext::declareDecoration<boost::optional<OpObserverImpl::DocumentKey>>();
 
 constexpr auto kNumRecordsFieldName = "numRecords"_sd;
 constexpr auto kMsgFieldName = "msg"_sd;
@@ -162,10 +161,14 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, args.updateArgs.stmtId);
 
     OpTimeBundle opTimes;
+    // We never want to store pre- or post- images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
     const auto storePreImageForRetryableWrite =
         (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage &&
          opCtx->getTxnNumber());
-    if (storePreImageForRetryableWrite || args.updateArgs.preImageRecordingEnabledForCollection) {
+    if ((storePreImageForRetryableWrite || args.updateArgs.preImageRecordingEnabledForCollection) &&
+        !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         invariant(args.updateArgs.preImageDoc);
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
@@ -178,7 +181,7 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
 
     // This case handles storing the post image for retryable findAndModify's.
     if (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PostImage &&
-        opCtx->getTxnNumber()) {
+        opCtx->getTxnNumber() && !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
         noopEntry.setObject(args.updateArgs.updatedDoc);
@@ -218,7 +221,10 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, stmtId);
 
     OpTimeBundle opTimes;
-    if (deletedDoc) {
+    // We never want to store pre-images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
+    if (deletedDoc && !migrationRecipientInfo) {
         MutableOplogEntry noopEntry = oplogEntry;
         noopEntry.setOpType(repl::OpTypeEnum::kNoop);
         noopEntry.setObject(*deletedDoc);
@@ -356,6 +362,10 @@ void OpObserverImpl::onStartIndexBuildSinglePhase(OperationContext* opCtx,
         {},
         boost::none,
         BSON("msg" << std::string(str::stream() << "Creating indexes. Coll: " << nss)),
+        boost::none,
+        boost::none,
+        boost::none,
+        boost::none,
         boost::none);
 }
 
@@ -486,12 +496,6 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         Scope::storedFuncMod(opCtx);
     } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, nss);
-    } else if (nss == NamespaceString::kServerConfigurationNamespace) {
-        // We must check server configuration collection writes for featureCompatibilityVersion
-        // document changes.
-        for (auto it = first; it != last; it++) {
-            FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, it->doc);
-        }
     } else if (nss == NamespaceString::kSessionTransactionsTableNamespace && !lastOpTime.isNull()) {
         for (auto it = first; it != last; it++) {
             MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, it->doc);
@@ -562,10 +566,6 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         Scope::storedFuncMod(opCtx);
     } else if (args.nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, args.nss);
-    } else if (args.nss == NamespaceString::kServerConfigurationNamespace) {
-        // We must check server configuration collection writes for featureCompatibilityVersion
-        // document changes.
-        FeatureCompatibilityVersion::onInsertOrUpdate(opCtx, args.updateArgs.updatedDoc);
     } else if (args.nss == NamespaceString::kSessionTransactionsTableNamespace &&
                !opTime.writeOpTime.isNull()) {
         MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx,
@@ -573,9 +573,8 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     } else if (args.nss == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
             opCtx, args.updateArgs.updatedDoc["_id"], args.updateArgs.updatedDoc);
-    } else if (args.nss == NamespaceString::kMigrationDonorsNamespace) {
-        migrating_tenant_donor_util::onTenantMigrationDonorStateTransition(
-            opCtx, args.updateArgs.updatedDoc);
+    } else if (args.nss == NamespaceString::kTenantMigrationDonorsNamespace) {
+        tenant_migration_donor::onDonorStateTransition(opCtx, args.updateArgs.updatedDoc);
     }
 }
 
@@ -633,11 +632,6 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
         Scope::storedFuncMod(opCtx);
     } else if (nss.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onExternalChange(opCtx, nss);
-    } else if (nss.isServerConfigurationCollection()) {
-        auto _id = documentKey.getId().firstElement();
-        if (_id.type() == BSONType::String &&
-            _id.String() == FeatureCompatibilityVersionParser::kParameterName)
-            uasserted(40670, "removing FeatureCompatibilityVersion document is not allowed");
     } else if (nss == NamespaceString::kSessionTransactionsTableNamespace &&
                !opTime.writeOpTime.isNull()) {
         MongoDSessionCatalog::observeDirectWriteToConfigTransactions(opCtx, documentKey.getId());
@@ -647,17 +641,28 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
     }
 }
 
-void OpObserverImpl::onInternalOpMessage(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         const boost::optional<UUID> uuid,
-                                         const BSONObj& msgObj,
-                                         const boost::optional<BSONObj> o2MsgObj) {
+void OpObserverImpl::onInternalOpMessage(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const boost::optional<UUID> uuid,
+    const BSONObj& msgObj,
+    const boost::optional<BSONObj> o2MsgObj,
+    const boost::optional<repl::OpTime> preImageOpTime,
+    const boost::optional<repl::OpTime> postImageOpTime,
+    const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
+    const boost::optional<OplogSlot> slot) {
     MutableOplogEntry oplogEntry;
     oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
     oplogEntry.setNss(nss);
     oplogEntry.setUuid(uuid);
     oplogEntry.setObject(msgObj);
     oplogEntry.setObject2(o2MsgObj);
+    oplogEntry.setPreImageOpTime(preImageOpTime);
+    oplogEntry.setPostImageOpTime(postImageOpTime);
+    oplogEntry.setPrevWriteOpTimeInTransaction(prevWriteOpTimeInTransaction);
+    if (slot) {
+        oplogEntry.setOpTime(*slot);
+    }
     logOperation(opCtx, &oplogEntry);
 }
 
@@ -1021,8 +1026,11 @@ int logOplogEntriesForTransaction(OperationContext* opCtx,
 
     prevWriteOpTime.writeOpTime = txnParticipant.getLastWriteOpTime();
     auto currOplogSlot = oplogSlots.begin();
+    // We never want to store pre-images when we're migrating oplog entries from another
+    // replica set.
+    const auto& migrationRecipientInfo = repl::tenantMigrationRecipientInfo(opCtx);
 
-    if (numberOfPreImagesToWrite > 0) {
+    if (numberOfPreImagesToWrite > 0 && !migrationRecipientInfo) {
         for (auto& statement : *stmts) {
             if (statement.getPreImage().isEmpty()) {
                 continue;
@@ -1325,9 +1333,6 @@ void OpObserverImpl::onReplicationRollback(OperationContext* opCtx,
     // Force the default read/write concern cache to reload on next access in case the defaults
     // document was rolled back.
     ReadWriteConcernDefaults::get(opCtx).invalidate();
-
-    // Make sure the in-memory FCV matches the on-disk FCV.
-    FeatureCompatibilityVersion::onReplicationRollback(opCtx);
 }
 
 }  // namespace mongo

@@ -204,21 +204,15 @@ Status addIndexBuildEntry(OperationContext* opCtx, const IndexBuildEntry& indexB
 
             WriteUnitOfWork wuow(opCtx);
 
-            Status status = Status::OK();
-            if (supportsDocLocking()) {
-                // Reserve a slot in the oplog. This must only be done for document level locking
-                // storage engines, which are allowed to insert oplog documents out-of-order into
-                // the oplog.
-                auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
-                auto oplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
-                status = collection->insertDocument(
-                    opCtx,
-                    InsertStatement(kUninitializedStmtId, indexBuildEntry.toBSON(), oplogSlot),
-                    nullptr);
-            } else {
-                status = collection->insertDocument(
-                    opCtx, InsertStatement(indexBuildEntry.toBSON()), nullptr);
-            }
+            // Reserve a slot in the oplog as the storage engine is allowed to insert oplog
+            // documents out-of-order into the oplog.
+            auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+            auto oplogSlot = oplogInfo->getNextOpTimes(opCtx, 1U)[0];
+            Status status = collection->insertDocument(
+                opCtx,
+                InsertStatement(kUninitializedStmtId, indexBuildEntry.toBSON(), oplogSlot),
+                nullptr);
+
             if (!status.isOK()) {
                 return status;
             }
@@ -262,7 +256,7 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     // Read the most up to date data.
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
     AutoGetCollectionForRead autoCollection(opCtx, NamespaceString::kIndexBuildEntryNamespace);
-    Collection* collection = autoCollection.getCollection();
+    const Collection* collection = autoCollection.getCollection();
 
     // Must not be interruptible. This fail point is used to test the scenario where the index
     // build's OperationContext is interrupted by an abort, which will subsequently remove index

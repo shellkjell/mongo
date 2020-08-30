@@ -34,6 +34,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/client/authenticate.h"
+#include "mongo/client/client_api_version_parameters_gen.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/index_spec.h"
@@ -109,11 +110,15 @@ class DBClientBase : public DBClientQueryInterface {
     DBClientBase& operator=(const DBClientBase&) = delete;
 
 public:
-    DBClientBase()
+    DBClientBase(const ClientAPIVersionParameters* apiParameters = nullptr)
         : _logLevel(logv2::LogSeverity::Log()),
           _connectionId(ConnectionIdSequence.fetchAndAdd(1)),
           _cachedAvailableOptions((enum QueryOptions)0),
-          _haveCachedAvailableOptions(false) {}
+          _haveCachedAvailableOptions(false) {
+        if (apiParameters) {
+            _apiParameters = *apiParameters;
+        }
+    }
 
     virtual ~DBClientBase() {}
 
@@ -753,6 +758,13 @@ public:
     virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
                                                       const Message& replyMsg);
 
+    /**
+     * Returns the latest operationTime tracked on this client.
+     */
+    Timestamp getOperationTime();
+
+    void setOperationTime(Timestamp operationTime);
+
     // This is only for DBClientCursor.
     static void (*withConnection_do_not_use)(std::string host, std::function<void(DBClientBase*)>);
 
@@ -762,6 +774,10 @@ public:
      */
     virtual const SSLConfiguration* getSSLConfiguration() = 0;
 #endif
+
+    const ClientAPIVersionParameters& getApiParameters() const {
+        return _apiParameters;
+    }
 
 protected:
     /** if the result of a command is ok*/
@@ -825,6 +841,12 @@ private:
 
     enum QueryOptions _cachedAvailableOptions;
     bool _haveCachedAvailableOptions;
+
+    // The operationTime associated with the last command handles by the client.
+    // TODO(SERVER-49791): Implement proper tracking of operationTime.
+    Timestamp _lastOperationTime;
+
+    ClientAPIVersionParameters _apiParameters;
 };  // DBClientBase
 
 BSONElement getErrField(const BSONObj& result);

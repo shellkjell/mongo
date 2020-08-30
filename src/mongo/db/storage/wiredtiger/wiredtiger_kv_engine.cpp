@@ -96,6 +96,7 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/stacktrace.h"
 #include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 
@@ -146,8 +147,8 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
             _startupVersion == StartupVersion::IS_42;
     }
 
-    if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
+    if (serverGlobalParams.featureCompatibility.isGreaterThan(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44)) {
         // Only consider downgrading when FCV is set to kFullyDowngraded.
         // (This FCV gate must remain across binary version releases.)
         return false;
@@ -787,6 +788,21 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     bb.done();
 }
 
+/**
+ * Table of MongoDB<->WiredTiger<->Log version numbers:
+ *
+ * |                MongoDB | WiredTiger | Log |
+ * |------------------------+------------+-----|
+ * |                 3.0.15 |      2.5.3 |   1 |
+ * |                 3.2.20 |      2.9.2 |   1 |
+ * |                 3.4.15 |      2.9.2 |   1 |
+ * |                  3.6.4 |      3.0.1 |   2 |
+ * |                 4.0.16 |      3.1.1 |   3 |
+ * |                  4.2.1 |      3.2.2 |   3 |
+ * |                  4.2.6 |      3.3.0 |   3 |
+ * | 4.2.6 (blessed by 4.4) |      3.3.0 |   4 |
+ * |                  4.4.0 |     10.0.0 |   5 |
+ */
 void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
     // MongoDB 4.4 will always run in compatibility version 10.0.
     std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"10.0.0\")";
@@ -1700,13 +1716,20 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
+Status WiredTigerKVEngine::dropGroupedSortedDataInterface(OperationContext* opCtx,
+                                                          StringData ident) {
+    return wtRCToStatus(WiredTigerIndex::Drop(opCtx, _uri(ident)));
+}
+
 std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getGroupedSortedDataInterface(
     OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
     if (desc->unique()) {
-        return std::make_unique<WiredTigerIndexUnique>(opCtx, _uri(ident), desc, prefix, _readOnly);
+        return std::make_unique<WiredTigerIndexUnique>(
+            opCtx, _uri(ident), ident, desc, prefix, _readOnly);
     }
 
-    return std::make_unique<WiredTigerIndexStandard>(opCtx, _uri(ident), desc, prefix, _readOnly);
+    return std::make_unique<WiredTigerIndexStandard>(
+        opCtx, _uri(ident), ident, desc, prefix, _readOnly);
 }
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
@@ -1739,10 +1762,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.isCapped = false;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
-    // Temporary collections do not need to persist size information to the size storer.
-    params.sizeStorer = nullptr;
-    // Temporary collections do not need to reconcile collection size/counts.
-    params.tracksSizeAdjustments = false;
+    params.sizeStorer = _sizeStorer.get();
+    params.tracksSizeAdjustments = true;
     params.isReadOnly = false;
 
     params.cappedMaxSize = -1;
@@ -1874,10 +1895,6 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
             invariantWTOK(ret);
         }
     }
-}
-
-bool WiredTigerKVEngine::supportsDocLocking() const {
-    return true;
 }
 
 bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
@@ -2127,7 +2144,7 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
     _initialDataTimestamp.store(initialDataTimestamp.asULL());
 }
 
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() {
+Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
     return Timestamp(_initialDataTimestamp.load());
 }
 
@@ -2374,17 +2391,21 @@ bool WiredTigerKVEngine::supportsOplogStones() const {
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<Latch> lock(_oplogManagerMutex);
-    if (_oplogManagerCount == 0)
-        _oplogManager->startVisibilityThread(opCtx, oplogRecordStore);
-    _oplogManagerCount++;
+    // Halt visibility thread if running on previous record store
+    if (_oplogRecordStore) {
+        _oplogManager->haltVisibilityThread();
+    }
+
+    _oplogManager->startVisibilityThread(opCtx, oplogRecordStore);
+    _oplogRecordStore = oplogRecordStore;
 }
 
-void WiredTigerKVEngine::haltOplogManager() {
+void WiredTigerKVEngine::haltOplogManager(WiredTigerRecordStore* oplogRecordStore) {
     stdx::unique_lock<Latch> lock(_oplogManagerMutex);
-    invariant(_oplogManagerCount > 0);
-    _oplogManagerCount--;
-    if (_oplogManagerCount == 0) {
+    // Halt visibility thread if the request match current
+    if (_oplogRecordStore == oplogRecordStore) {
         _oplogManager->haltVisibilityThread();
+        _oplogRecordStore = nullptr;
     }
 }
 
@@ -2398,10 +2419,6 @@ Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
 
 Timestamp WiredTigerKVEngine::getCheckpointTimestamp() const {
     return Timestamp(_getCheckpointTimestamp());
-}
-
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
-    return Timestamp(_initialDataTimestamp.load());
 }
 
 std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {

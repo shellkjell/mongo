@@ -84,7 +84,8 @@ public:
                            const std::vector<BSONObj>& specs,
                            const UUID& buildUUID,
                            OnInitFn onInit,
-                           SetupOptions options = {});
+                           SetupOptions options = {},
+                           const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
 
     /**
      * Unregisters the builder associated with the given buildUUID from the _builders map.
@@ -96,7 +97,10 @@ public:
      */
     Status startBuildingIndex(OperationContext* opCtx,
                               Collection* collection,
-                              const UUID& buildUUID);
+                              const UUID& buildUUID,
+                              boost::optional<RecordId> resumeAfterRecordId = boost::none);
+
+    Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx, const UUID& buildUUID);
 
     /**
      * Iterates through every record in the collection to index it. May also remove documents
@@ -105,7 +109,7 @@ public:
      * Returns the number of records and the size of the data iterated over.
      */
     StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
-        OperationContext* opCtx, NamespaceString ns, const UUID& buildUUID, RepairData repair);
+        OperationContext* opCtx, Collection* coll, const UUID& buildUUID, RepairData repair);
 
     /**
      * Document inserts observed during the scanning/insertion phase of an index build are not
@@ -161,7 +165,7 @@ public:
     bool abortIndexBuildWithoutCleanupForRollback(OperationContext* opCtx,
                                                   Collection* collection,
                                                   const UUID& buildUUID,
-                                                  const std::string& reason);
+                                                  bool isResumable);
 
     /**
      * The same as abortIndexBuildWithoutCleanupForRollback above, but additionally writes the
@@ -170,7 +174,8 @@ public:
      */
     bool abortIndexBuildWithoutCleanupForShutdown(OperationContext* opCtx,
                                                   Collection* collection,
-                                                  const UUID& buildUUID);
+                                                  const UUID& buildUUID,
+                                                  bool isResumable);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
@@ -182,6 +187,17 @@ public:
      * Checks via invariant that the manager has no index builds presently.
      */
     void verifyNoIndexBuilds_forTestOnly();
+
+    /**
+     * Returns the information to resume each resumable index build that was aborted for rollback.
+     */
+    std::vector<ResumeIndexInfo> getResumeInfos() const;
+
+    /**
+     * Clears the vector that was used to store the information to resume each resumable index
+     * build after rollback.
+     */
+    void clearResumeInfos();
 
 private:
     /**
@@ -201,13 +217,18 @@ private:
     // taken on and information passed to and from index builds.
     std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
 
+    // The information to resume each resumable index build that was aborted for rollback.
+    std::vector<ResumeIndexInfo> _resumeInfos;
+
     /**
-     * Deletes records containing duplicate keys and inserts them into a local lost and found
-     * collection titled "local.system.lost_and_found.<original collection UUID>".
+     * Deletes record containing duplicate keys and insert it into a local lost and found collection
+     * titled "local.lost_and_found.<original collection UUID>". Returns the size of the
+     * record removed.
      */
-    StatusWith<long long> _moveDocsToLostAndFound(OperationContext* opCtx,
-                                                  NamespaceString ns,
-                                                  std::set<RecordId>* dupRecords);
+    StatusWith<int> _moveRecordToLostAndFound(OperationContext* opCtx,
+                                              const NamespaceString& ns,
+                                              const NamespaceString& lostAndFoundNss,
+                                              RecordId dupRecord);
 };
 
 }  // namespace mongo

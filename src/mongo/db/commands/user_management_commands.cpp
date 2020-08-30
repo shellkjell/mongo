@@ -88,45 +88,21 @@ Status useDefaultCode(const Status& status, ErrorCodes::Error defaultCode) {
     return Status(defaultCode, status.reason());
 }
 
-BSONArray roleSetToBSONArray(const stdx::unordered_set<RoleName>& roles) {
-    BSONArrayBuilder rolesArrayBuilder;
-    for (stdx::unordered_set<RoleName>::const_iterator it = roles.begin(); it != roles.end();
-         ++it) {
-        const RoleName& role = *it;
-        rolesArrayBuilder.append(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                      << role.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                      << role.getDB()));
+template <typename Container>
+BSONArray containerToBSONArray(const Container& container) {
+    BSONArrayBuilder arrayBuilder;
+    for (const auto& item : container) {
+        arrayBuilder.append(item.toBSON());
     }
-    return rolesArrayBuilder.arr();
-}
-
-BSONArray rolesVectorToBSONArray(const std::vector<RoleName>& roles) {
-    BSONArrayBuilder rolesArrayBuilder;
-    for (std::vector<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
-        const RoleName& role = *it;
-        rolesArrayBuilder.append(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
-                                      << role.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME
-                                      << role.getDB()));
-    }
-    return rolesArrayBuilder.arr();
+    return arrayBuilder.arr();
 }
 
 Status privilegeVectorToBSONArray(const PrivilegeVector& privileges, BSONArray* result) {
-    BSONArrayBuilder arrBuilder;
-    for (PrivilegeVector::const_iterator it = privileges.begin(); it != privileges.end(); ++it) {
-        const Privilege& privilege = *it;
-
-        ParsedPrivilege parsedPrivilege;
-        std::string errmsg;
-        if (!ParsedPrivilege::privilegeToParsedPrivilege(privilege, &parsedPrivilege, &errmsg)) {
-            return Status(ErrorCodes::FailedToParse, errmsg);
-        }
-        if (!parsedPrivilege.isValid(&errmsg)) {
-            return Status(ErrorCodes::FailedToParse, errmsg);
-        }
-        arrBuilder.append(parsedPrivilege.toBSON());
-    }
-    *result = arrBuilder.arr();
+    // privileges may come in with non-unique ResourcePatterns.
+    // Make a local copy so that ActionSets are merged.
+    PrivilegeVector uniquePrivileges;
+    Privilege::addPrivilegesToPrivilegeVector(&uniquePrivileges, privileges);
+    *result = containerToBSONArray(uniquePrivileges);
     return Status::OK();
 }
 
@@ -158,47 +134,42 @@ Status getCurrentUserRoles(OperationContext* opCtx,
  */
 Status checkOkayToGrantRolesToRole(OperationContext* opCtx,
                                    const RoleName& role,
-                                   const std::vector<RoleName> rolesToAdd,
+                                   const std::vector<RoleName>& rolesToAdd,
                                    AuthorizationManager* authzManager) {
-    for (std::vector<RoleName>::const_iterator it = rolesToAdd.begin(); it != rolesToAdd.end();
-         ++it) {
-        const RoleName& roleToAdd = *it;
+    for (const auto& roleToAdd : rolesToAdd) {
         if (roleToAdd == role) {
-            return Status(ErrorCodes::InvalidRoleModification,
-                          str::stream()
-                              << "Cannot grant role " << role.getFullName() << " to itself.");
+            return {ErrorCodes::InvalidRoleModification,
+                    str::stream() << "Cannot grant role " << role.getFullName() << " to itself."};
         }
 
         if (role.getDB() != "admin" && roleToAdd.getDB() != role.getDB()) {
-            return Status(ErrorCodes::InvalidRoleModification,
-                          str::stream()
-                              << "Roles on the \'" << role.getDB()
-                              << "\' database cannot be granted roles from other databases");
-        }
-
-        BSONObj roleToAddDoc;
-        Status status = authzManager->getRoleDescription(opCtx, roleToAdd, &roleToAddDoc);
-        if (status == ErrorCodes::RoleNotFound) {
-            return Status(ErrorCodes::RoleNotFound,
-                          "Cannot grant nonexistent role " + roleToAdd.toString());
-        }
-        if (!status.isOK()) {
-            return status;
-        }
-        std::vector<RoleName> indirectRoles;
-        status = auth::parseRoleNamesFromBSONArray(
-            BSONArray(roleToAddDoc["inheritedRoles"].Obj()), role.getDB(), &indirectRoles);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (sequenceContains(indirectRoles, role)) {
-            return Status(ErrorCodes::InvalidRoleModification,
-                          str::stream() << "Granting " << roleToAdd.getFullName() << " to "
-                                        << role.getFullName()
-                                        << " would introduce a cycle in the role graph.");
+            return {ErrorCodes::InvalidRoleModification,
+                    str::stream() << "Roles on the \'" << role.getDB()
+                                  << "\' database cannot be granted roles from other databases"};
         }
     }
+
+    auto status = authzManager->rolesExist(opCtx, rolesToAdd);
+    if (!status.isOK()) {
+        return {status.code(),
+                str::stream() << "Cannot grant roles to '" << role.toString()
+                              << "': " << status.reason()};
+    }
+
+    auto swData = authzManager->resolveRoles(
+        opCtx, rolesToAdd, AuthorizationManager::ResolveRoleOption::kRoles);
+    if (!swData.isOK()) {
+        return {swData.getStatus().code(),
+                str::stream() << "Cannot grant roles to '" << role.toString()
+                              << "': " << swData.getStatus().reason()};
+    }
+
+    if (sequenceContains(swData.getValue().roles.get(), role)) {
+        return {ErrorCodes::InvalidRoleModification,
+                str::stream() << "Granting roles to " << role.getFullName()
+                              << " would introduce a cycle in the role graph"};
+    }
+
     return Status::OK();
 }
 
@@ -303,7 +274,8 @@ Status updateAuthzDocuments(OperationContext* opCtx,
                               updateOp.setUpdates({[&] {
                                   write_ops::UpdateOpEntry entry;
                                   entry.setQ(query);
-                                  entry.setU(updatePattern);
+                                  entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                                      updatePattern));
                                   entry.setMulti(multi);
                                   entry.setUpsert(upsert);
                                   return entry;
@@ -882,11 +854,7 @@ void CmdUMCTyped<CreateUserCommand, void>::Invocation::typedRun(OperationContext
     uassertStatusOK(V2UserDocumentParser().checkValidUserDocument(userObj));
 
     // Role existence has to be checked after acquiring the update lock
-    for (const auto& role : cmd.getRoles()) {
-        BSONObj ignored;
-        uassertStatusOK(
-            authzManager->getRoleDescription(opCtx, role.getRoleName(dbname), &ignored));
-    }
+    uassertStatusOK(authzManager->rolesExist(opCtx, resolvedRoles));
 
     // Audit this event.
     auto optCustomData = cmd.getCustomData();
@@ -988,11 +956,8 @@ void CmdUMCTyped<UpdateUserCommand, void>::Invocation::typedRun(OperationContext
 
     // Role existence has to be checked after acquiring the update lock
     if (auto roles = cmd.getRoles()) {
-        for (const auto& role : roles.get()) {
-            BSONObj ignored;
-            uassertStatusOK(
-                authzManager->getRoleDescription(opCtx, role.getRoleName(dbname), &ignored));
-        }
+        auto resolvedRoles = auth::resolveRoleNames(roles.get(), dbname);
+        uassertStatusOK(authzManager->rolesExist(opCtx, resolvedRoles));
     }
 
     // Audit this event.
@@ -1094,14 +1059,13 @@ void CmdUMCTyped<GrantRolesToUserCommand, void>::Invocation::typedRun(OperationC
     uassertStatusOK(getCurrentUserRoles(opCtx, authzManager, userName, &userRoles));
 
     auto resolvedRoleNames = auth::resolveRoleNames(cmd.getRoles(), dbname);
+    uassertStatusOK(authzManager->rolesExist(opCtx, resolvedRoleNames));
     for (const auto& role : resolvedRoleNames) {
-        BSONObj roleDoc;
-        uassertStatusOK(authzManager->getRoleDescription(opCtx, role, &roleDoc));
         userRoles.insert(role);
     }
 
     audit::logGrantRolesToUser(client, userName, resolvedRoleNames);
-    auto newRolesBSONArray = roleSetToBSONArray(userRoles);
+    auto newRolesBSONArray = containerToBSONArray(userRoles);
     auto status = updatePrivilegeDocument(
         opCtx, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)));
 
@@ -1130,14 +1094,13 @@ void CmdUMCTyped<RevokeRolesFromUserCommand, void>::Invocation::typedRun(Operati
     uassertStatusOK(getCurrentUserRoles(opCtx, authzManager, userName, &userRoles));
 
     auto resolvedUserRoles = auth::resolveRoleNames(cmd.getRoles(), dbname);
+    uassertStatusOK(authzManager->rolesExist(opCtx, resolvedUserRoles));
     for (const auto& role : resolvedUserRoles) {
-        BSONObj roleDoc;
-        uassertStatusOK(authzManager->getRoleDescription(opCtx, role, &roleDoc));
         userRoles.erase(role);
     }
 
     audit::logRevokeRolesFromUser(client, userName, resolvedUserRoles);
-    BSONArray newRolesBSONArray = roleSetToBSONArray(userRoles);
+    BSONArray newRolesBSONArray = containerToBSONArray(userRoles);
     auto status = updatePrivilegeDocument(
         opCtx, userName, BSON("$set" << BSON("roles" << newRolesBSONArray)));
 
@@ -1332,7 +1295,7 @@ void CmdUMCTyped<CreateRoleCommand, void>::Invocation::typedRun(OperationContext
     roleObjBuilder.append("privileges", privileges);
 
     auto resolvedRoleNames = auth::resolveRoleNames(cmd.getRoles(), dbname);
-    roleObjBuilder.append("roles", rolesVectorToBSONArray(resolvedRoleNames));
+    roleObjBuilder.append("roles", containerToBSONArray(resolvedRoleNames));
 
     boost::optional<BSONArray> bsonAuthRestrictions;
     if (auto ar = cmd.getAuthenticationRestrictions(); ar && !ar->empty()) {
@@ -1381,7 +1344,7 @@ void CmdUMCTyped<UpdateRoleCommand, void>::Invocation::typedRun(OperationContext
     boost::optional<std::vector<RoleName>> optRoles;
     if (auto roles = cmd.getRoles()) {
         optRoles = auth::resolveRoleNames(roles.get(), dbname);
-        updateSetBuilder.append("roles", rolesVectorToBSONArray(*optRoles));
+        updateSetBuilder.append("roles", containerToBSONArray(*optRoles));
     }
 
     BSONArray authRest;
@@ -1400,8 +1363,7 @@ void CmdUMCTyped<UpdateRoleCommand, void>::Invocation::typedRun(OperationContext
     auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
 
     // Role existence has to be checked after acquiring the update lock
-    BSONObj ignored;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx, roleName, &ignored));
+    uassertStatusOK(authzManager->rolesExist(opCtx, {roleName}));
 
     if (optRoles) {
         uassertStatusOK(checkOkayToGrantRolesToRole(opCtx, roleName, *optRoles, authzManager));
@@ -1454,17 +1416,10 @@ void CmdUMCTyped<GrantPrivilegesToRoleCommand, void>::Invocation::typedRun(
 
     uassertStatusOK(checkOkayToGrantPrivilegesToRole(roleName, cmd.getPrivileges()));
 
-    BSONObj roleDoc;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx,
-                                                     roleName,
-                                                     PrivilegeFormat::kShowSeparate,
-                                                     AuthenticationRestrictionsFormat::kOmit,
-                                                     &roleDoc));
-
-    PrivilegeVector privileges;
-    uassertStatusOK(
-        auth::parseAndValidatePrivilegeArray(BSONArray(roleDoc["privileges"].Obj()), &privileges));
-
+    // Add additional privileges to existing set.
+    auto data = uassertStatusOK(authzManager->resolveRoles(
+        opCtx, {roleName}, AuthorizationManager::ResolveRoleOption::kDirectPrivileges));
+    auto privileges = std::move(data.privileges.get());
     for (const auto& priv : cmd.getPrivileges()) {
         Privilege::addPrivilegeToPrivilegeVector(&privileges, priv);
     }
@@ -1509,17 +1464,9 @@ void CmdUMCTyped<RevokePrivilegesFromRoleCommand, void>::Invocation::typedRun(
     auto* authzManager = AuthorizationManager::get(serviceContext);
     auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
 
-    BSONObj roleDoc;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx,
-                                                     roleName,
-                                                     PrivilegeFormat::kShowSeparate,
-                                                     AuthenticationRestrictionsFormat::kOmit,
-                                                     &roleDoc));
-
-    PrivilegeVector privileges;
-    uassertStatusOK(
-        auth::parseAndValidatePrivilegeArray(BSONArray(roleDoc["privileges"].Obj()), &privileges));
-
+    auto data = uassertStatusOK(authzManager->resolveRoles(
+        opCtx, {roleName}, AuthorizationManager::ResolveRoleOption::kDirectPrivileges));
+    auto privileges = std::move(data.privileges.get());
     for (const auto& rmPriv : cmd.getPrivileges()) {
         for (auto it = privileges.begin(); it != privileges.end(); ++it) {
             if (it->getResourcePattern() == rmPriv.getResourcePattern()) {
@@ -1573,28 +1520,19 @@ void CmdUMCTyped<GrantRolesToRoleCommand, void>::Invocation::typedRun(OperationC
     auto* authzManager = AuthorizationManager::get(serviceContext);
     auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
 
-    // Role existence has to be checked after acquiring the update lock
-    BSONObj roleDoc;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx, roleName, &roleDoc));
-
     // Check for cycles
     uassertStatusOK(checkOkayToGrantRolesToRole(opCtx, roleName, rolesToAdd, authzManager));
 
     // Add new roles to existing roles
-    std::vector<RoleName> directRoles;
-    uassertStatusOK(auth::parseRoleNamesFromBSONArray(
-        BSONArray(roleDoc["roles"].Obj()), roleName.getDB(), &directRoles));
-    for (const auto& roleToAdd : rolesToAdd) {
-        if (!sequenceContains(directRoles, roleToAdd)) {
-            // Don't double-add role
-            directRoles.push_back(roleToAdd);
-        }
-    }
+    auto data = uassertStatusOK(authzManager->resolveRoles(
+        opCtx, {roleName}, AuthorizationManager::ResolveRoleOption::kDirectRoles));
+    auto directRoles = std::move(data.roles.get());
+    directRoles.insert(rolesToAdd.cbegin(), rolesToAdd.cend());
 
     audit::logGrantRolesToRole(client, roleName, rolesToAdd);
 
     auto status = updateRoleDocument(
-        opCtx, roleName, BSON("$set" << BSON("roles" << rolesVectorToBSONArray(directRoles))));
+        opCtx, roleName, BSON("$set" << BSON("roles" << containerToBSONArray(directRoles))));
     // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
     authzManager->invalidateUserCache(opCtx);
     uassertStatusOK(status);
@@ -1622,23 +1560,18 @@ void CmdUMCTyped<RevokeRolesFromRoleCommand, void>::Invocation::typedRun(Operati
     auto* authzManager = AuthorizationManager::get(serviceContext);
     auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
 
-    BSONObj roleDoc;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx, roleName, &roleDoc));
-
-    std::vector<RoleName> roles;
-    uassertStatusOK(auth::parseRoleNamesFromBSONArray(
-        BSONArray(roleDoc["roles"].Obj()), roleName.getDB(), &roles));
-
+    // Remove roles from existing set.
+    auto data = uassertStatusOK(authzManager->resolveRoles(
+        opCtx, {roleName}, AuthorizationManager::ResolveRoleOption::kDirectRoles));
+    auto roles = std::move(data.roles.get());
     for (const auto& roleToRemove : rolesToRemove) {
-        if (auto it = std::find(roles.begin(), roles.end(), roleToRemove); it != roles.end()) {
-            roles.erase(it);
-        }
+        roles.erase(roleToRemove);
     }
 
     audit::logRevokeRolesFromRole(client, roleName, rolesToRemove);
 
     auto status = updateRoleDocument(
-        opCtx, roleName, BSON("$set" << BSON("roles" << rolesVectorToBSONArray(roles))));
+        opCtx, roleName, BSON("$set" << BSON("roles" << containerToBSONArray(roles))));
     // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
     authzManager->invalidateUserCache(opCtx);
     uassertStatusOK(status);
@@ -1660,8 +1593,7 @@ void CmdUMCTyped<DropRoleCommand, void>::Invocation::typedRun(OperationContext* 
     auto* authzManager = AuthorizationManager::get(serviceContext);
     auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
 
-    BSONObj roleDoc;
-    uassertStatusOK(authzManager->getRoleDescription(opCtx, roleName, &roleDoc));
+    uassertStatusOK(authzManager->rolesExist(opCtx, {roleName}));
 
     // From here on, we always want to invalidate the user cache before returning.
     auto invalidateGuard = makeGuard([&] {
@@ -1861,39 +1793,32 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auth::RolesInfoArgs args;
-        Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
-        uassertStatusOK(status);
+        uassertStatusOK(auth::parseRolesInfoCommand(cmdObj, dbname, &args));
 
         AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
         auto lk = uassertStatusOK(requireReadableAuthSchema26Upgrade(opCtx, authzManager));
 
         if (args.allForDB) {
-            std::vector<BSONObj> rolesDocs;
-            status = authzManager->getRoleDescriptionsForDB(opCtx,
-                                                            dbname,
-                                                            args.privilegeFormat,
-                                                            args.authenticationRestrictionsFormat,
-                                                            args.showBuiltinRoles,
-                                                            &rolesDocs);
-            uassertStatusOK(status);
-
             if (args.privilegeFormat == PrivilegeFormat::kShowAsUserFragment) {
                 uasserted(ErrorCodes::IllegalOperation,
                           "Cannot get user fragment for all roles in a database");
             }
-            BSONArrayBuilder rolesArrayBuilder;
-            for (size_t i = 0; i < rolesDocs.size(); ++i) {
-                rolesArrayBuilder.append(rolesDocs[i]);
-            }
-            result.append("roles", rolesArrayBuilder.arr());
-        } else {
-            BSONObj roleDetails;
-            status = authzManager->getRolesDescription(opCtx,
-                                                       args.roleNames,
+
+            BSONArrayBuilder rolesBuilder(result.subarrayStart("roles"));
+            uassertStatusOK(
+                authzManager->getRoleDescriptionsForDB(opCtx,
+                                                       dbname,
                                                        args.privilegeFormat,
                                                        args.authenticationRestrictionsFormat,
-                                                       &roleDetails);
-            uassertStatusOK(status);
+                                                       args.showBuiltinRoles,
+                                                       &rolesBuilder));
+        } else {
+            BSONObj roleDetails;
+            uassertStatusOK(authzManager->getRolesDescription(opCtx,
+                                                              args.roleNames,
+                                                              args.privilegeFormat,
+                                                              args.authenticationRestrictionsFormat,
+                                                              &roleDetails));
 
             if (args.privilegeFormat == PrivilegeFormat::kShowAsUserFragment) {
                 result.append("userFragment", roleDetails);

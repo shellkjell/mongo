@@ -174,6 +174,8 @@ public:
         return createSortedDataInterface(opCtx, collOptions, ident, desc);
     }
 
+    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) = 0;
+
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
 
     /**
@@ -270,11 +272,6 @@ public:
     /**
      * This must not change over the lifetime of the engine.
      */
-    virtual bool supportsDocLocking() const = 0;
-
-    /**
-     * This must not change over the lifetime of the engine.
-     */
     virtual bool supportsCappedCollections() const {
         return true;
     }
@@ -335,7 +332,7 @@ public:
     /**
      * See `StorageEngine::getInitialDataTimestamp`
      */
-    virtual Timestamp getInitialDataTimestamp() {
+    virtual Timestamp getInitialDataTimestamp() const {
         return Timestamp();
     }
 

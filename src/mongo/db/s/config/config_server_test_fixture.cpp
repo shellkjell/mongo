@@ -142,7 +142,6 @@ void ConfigServerTestFixture::_setUp(std::function<void()> onPreInitGlobalStateF
 
     _addShardNetworkTestEnv =
         std::make_unique<NetworkTestEnv>(_executorForAddShard, _mockNetworkForAddShard);
-
     CatalogCacheLoader::set(getServiceContext(),
                             std::make_unique<ConfigServerCatalogCacheLoader>());
 
@@ -234,22 +233,23 @@ Status ConfigServerTestFixture::updateToConfigCollection(OperationContext* opCtx
                                                          const BSONObj& query,
                                                          const BSONObj& update,
                                                          const bool upsert) {
-    auto updateResponse = getConfigShard()->runCommand(opCtx,
-                                                       kReadPref,
-                                                       ns.db().toString(),
-                                                       [&]() {
-                                                           write_ops::Update updateOp(ns);
-                                                           updateOp.setUpdates({[&] {
-                                                               write_ops::UpdateOpEntry entry;
-                                                               entry.setQ(query);
-                                                               entry.setU(update);
-                                                               entry.setUpsert(upsert);
-                                                               return entry;
-                                                           }()});
-                                                           return updateOp.toBSON({});
-                                                       }(),
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       Shard::RetryPolicy::kNoRetry);
+    auto updateResponse = getConfigShard()->runCommand(
+        opCtx,
+        kReadPref,
+        ns.db().toString(),
+        [&]() {
+            write_ops::Update updateOp(ns);
+            updateOp.setUpdates({[&] {
+                write_ops::UpdateOpEntry entry;
+                entry.setQ(query);
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+                entry.setUpsert(upsert);
+                return entry;
+            }()});
+            return updateOp.toBSON({});
+        }(),
+        Shard::kDefaultConfigCommandTimeout,
+        Shard::RetryPolicy::kNoRetry);
 
 
     BatchedCommandResponse batchResponse;

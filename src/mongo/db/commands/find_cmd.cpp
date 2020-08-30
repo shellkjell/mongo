@@ -128,6 +128,10 @@ class FindCmd final : public Command {
 public:
     FindCmd() : Command("find") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
         // TODO: Parse into a QueryRequest here.
@@ -232,7 +236,7 @@ public:
             boost::optional<AutoGetCollectionForReadCommand> ctx;
             ctx.emplace(opCtx,
                         CommandHelpers::parseNsCollectionRequired(_dbName, _request.body),
-                        AutoGetCollection::ViewMode::kViewsPermitted);
+                        AutoGetCollectionViewMode::kViewsPermitted);
             const auto nss = ctx->getNss();
 
             // Parse the command BSON to a QueryRequest.
@@ -281,7 +285,7 @@ public:
 
             // The collection may be NULL. If so, getExecutor() should handle it by returning an
             // execution tree with an EOFStage.
-            Collection* const collection = ctx->getCollection();
+            const Collection* const collection = ctx->getCollection();
 
             // Get the execution plan for the query.
             bool permitYield = true;
@@ -312,6 +316,7 @@ public:
             auto parsedNss =
                 NamespaceString{CommandHelpers::parseNsFromCommand(_dbName, _request.body)};
             const bool isExplain = false;
+            const bool isOplogNss = (parsedNss == NamespaceString::kRsOplogNamespace);
             auto qr =
                 parseCmdObjectToQueryRequest(opCtx, std::move(parsedNss), _request.body, isExplain);
 
@@ -340,7 +345,7 @@ public:
 
             // The presence of a term in the request indicates that this is an internal replication
             // oplog read request.
-            if (term && parsedNss == NamespaceString::kRsOplogNamespace) {
+            if (term && isOplogNss) {
                 // We do not want to take tickets for internal (replication) oplog reads. Stalling
                 // on ticket acquisition can cause complicated deadlocks. Primaries may depend on
                 // data reaching secondaries in order to proceed; and secondaries may get stalled
@@ -354,7 +359,7 @@ public:
             boost::optional<AutoGetCollectionForReadCommand> ctx;
             ctx.emplace(opCtx,
                         CommandHelpers::parseNsOrUUID(_dbName, _request.body),
-                        AutoGetCollection::ViewMode::kViewsPermitted);
+                        AutoGetCollectionViewMode::kViewsPermitted);
             const auto& nss = ctx->getNss();
 
             qr->refreshNSS(opCtx);
@@ -403,7 +408,7 @@ public:
                 return;
             }
 
-            Collection* const collection = ctx->getCollection();
+            const Collection* const collection = ctx->getCollection();
 
             if (cq->getQueryRequest().isReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
@@ -418,7 +423,7 @@ public:
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+                CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
             }
 
             if (!collection) {
@@ -472,7 +477,7 @@ public:
                               "stats: {stats}",
                               "Plan executor error during find command",
                               "error"_attr = exception.toStatus(),
-                              "stats"_attr = redact(Explain::getWinningPlanStats(exec.get())));
+                              "stats"_attr = redact(exec->getStats()));
 
                 exception.addContext("Executor error during find command");
                 throw;
@@ -486,6 +491,7 @@ public:
                     {std::move(exec),
                      nss,
                      AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                     APIParameters::get(opCtx),
                      opCtx->getWriteConcern(),
                      repl::ReadConcernArgs::get(opCtx),
                      _request.body,

@@ -72,6 +72,10 @@ public:
                                              StringData ident,
                                              const IndexDescriptor* desc);
 
+    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
+        return Status::OK();
+    }
+
     virtual std::unique_ptr<mongo::SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
@@ -82,10 +86,6 @@ public:
     virtual void endBackup(OperationContext* opCtx) {}
 
     virtual Status dropIdent(OperationContext* opCtx, mongo::RecoveryUnit* ru, StringData ident);
-
-    virtual bool supportsDocLocking() const {
-        return true;
-    }
 
     virtual bool supportsDirectoryPerDB() const {
         return false;  // Not persistant so no Directories
@@ -146,12 +146,12 @@ public:
     // Ephemeral for test Specific
 
     /**
-     * Returns a pair of the current version and copy of tree of the master.
+     * Returns a pair of the current version and a shared_ptr of tree of the master at the provided
+     * timestamp. Null timestamps will return the latest master and timestamps before oldest
+     * timestamp will throw SnapshotTooOld exception.
      */
-    std::pair<uint64_t, StringStore> getMasterInfo() {
-        stdx::lock_guard<Latch> lock(_masterLock);
-        return std::make_pair(_masterVersion, _master);
-    }
+    std::pair<uint64_t, std::shared_ptr<StringStore>> getMasterInfo(
+        boost::optional<Timestamp> timestamp = boost::none);
 
     /**
      * Returns true and swaps _master to newMaster if the version passed in is the same as the
@@ -163,7 +163,29 @@ public:
         return _visibilityManager.get();
     }
 
+    /**
+     * History in the map that is older than the oldest timestamp can be removed. Additionally, if
+     * the tree at the oldest timestamp is no longer in use by any active transactions it can be
+     * cleaned up, up until the point where there's an active transaction in the map. That point
+     * also becomes the new oldest timestamp.
+     */
+    void cleanHistory();
+
+    Timestamp getOldestTimestamp() const override;
+
+    void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) override;
+
+    std::map<Timestamp, std::shared_ptr<StringStore>> getHistory_forTest();
+
+    static bool instanceExists();
+
 private:
+    void _cleanHistory(WithLock);
+
+    Timestamp _getOldestTimestamp(WithLock) const {
+        return _availableHistory.begin()->first;
+    }
+
     std::shared_ptr<void> _catalogInfo;
     int _cachePressureForTest = 0;
     mutable Mutex _identsLock = MONGO_MAKE_LATCH("KVEngine::_identsLock");
@@ -171,8 +193,14 @@ private:
     std::unique_ptr<VisibilityManager> _visibilityManager;
 
     mutable Mutex _masterLock = MONGO_MAKE_LATCH("KVEngine::_masterLock");
-    StringStore _master;
-    uint64_t _masterVersion = 0;
+    std::shared_ptr<StringStore> _master;
+    // While write transactions aren't implemented, we use the _masterVersion to generate mock
+    // commit timestamps. We need to start at 1 to avoid the null timestamp.
+    uint64_t _masterVersion = 1;
+
+    // This map contains the different versions of the StringStore's referenced by their commit
+    // timestamps.
+    std::map<Timestamp, std::shared_ptr<StringStore>> _availableHistory;
 };
 }  // namespace ephemeral_for_test
 }  // namespace mongo

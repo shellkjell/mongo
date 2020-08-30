@@ -32,7 +32,6 @@
 #include "mongo/db/vector_clock.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/query.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/logical_clock_gen.h"
 #include "mongo/db/logical_time_validator.h"
@@ -40,7 +39,6 @@
 #include "mongo/util/static_immortal.h"
 
 namespace mongo {
-
 namespace {
 
 const auto vectorClockDecoration = ServiceContext::declareDecoration<VectorClock*>();
@@ -160,9 +158,9 @@ public:
              BSONObjBuilder* out,
              LogicalTime time,
              Component component) const override {
-        const auto& fcv = serverGlobalParams.featureCompatibility;
-        if (fcv.isVersionInitialized() &&
-            fcv.getVersion() == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
             return ActualFormat::out(service, opCtx, permitRefresh, out, time, component);
         }
         return false;
@@ -333,12 +331,17 @@ bool VectorClock::gossipOut(OperationContext* opCtx,
     if (opCtx && opCtx->getClient()) {
         clientSessionTags = opCtx->getClient()->getSessionTags();
     }
-    VectorTime now = getTime();
-    if (clientSessionTags & transport::Session::kInternalClient) {
-        return _gossipOutInternal(opCtx, outMessage, now._time);
-    } else {
-        return _gossipOutExternal(opCtx, outMessage, now._time);
+
+    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
+        ? _gossipOutInternal()
+        : _gossipOutExternal();
+
+    auto now = getTime();
+    bool clusterTimeWasOutput = false;
+    for (auto component : toGossip) {
+        clusterTimeWasOutput |= _gossipOutComponent(opCtx, outMessage, now._time, component);
     }
+    return clusterTimeWasOutput;
 }
 
 void VectorClock::gossipIn(OperationContext* opCtx,
@@ -352,11 +355,18 @@ void VectorClock::gossipIn(OperationContext* opCtx,
     if (opCtx && opCtx->getClient()) {
         clientSessionTags = opCtx->getClient()->getSessionTags();
     }
-    if (clientSessionTags & transport::Session::kInternalClient) {
-        _advanceTime(_gossipInInternal(opCtx, inMessage, couldBeUnauthenticated));
-    } else {
-        _advanceTime(_gossipInExternal(opCtx, inMessage, couldBeUnauthenticated));
+
+    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
+        ? _gossipInInternal()
+        : _gossipInExternal();
+
+    LogicalTimeArray newTime;
+    for (auto component : toGossip) {
+        _gossipInComponent(opCtx, inMessage, couldBeUnauthenticated, &newTime, component);
     }
+    // Since the times in LogicalTimeArray are default constructed (ie. to Timestamp(0, 0)), any
+    // component not present in the input BSONObj won't be advanced.
+    _advanceTime(std::move(newTime));
 }
 
 bool VectorClock::_gossipOutComponent(OperationContext* opCtx,
@@ -400,15 +410,10 @@ void VectorClock::resetVectorClock_forTest() {
     _isEnabled = true;
 }
 
-void VectorClock::advanceTime_forTest(Component component, LogicalTime newTime) {
+void VectorClock::_advanceTime_forTest(Component component, LogicalTime newTime) {
     LogicalTimeArray newTimeArray;
     newTimeArray[component] = newTime;
     _advanceTime(std::move(newTimeArray));
-}
-
-const Query& VectorClock::stateQuery() {
-    static StaticImmortal q{QUERY(VectorClockDocument::k_idFieldName << kDocIdKey)};
-    return *q;
 }
 
 }  // namespace mongo

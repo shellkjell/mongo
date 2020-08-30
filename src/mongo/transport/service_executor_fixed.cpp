@@ -34,7 +34,10 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/logv2/log.h"
 #include "mongo/transport/service_executor_gen.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 
@@ -45,6 +48,15 @@ namespace {
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "fixed"_sd;
+
+const auto getServiceExecutorFixed =
+    ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorFixed>>();
+
+const auto serviceExecutorFixedRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "ServiceExecutorFixed", [](ServiceContext* ctx) {
+        getServiceExecutorFixed(ctx) =
+            std::make_unique<ServiceExecutorFixed>(ThreadPool::Options{});
+    }};
 }  // namespace
 
 ServiceExecutorFixed::ServiceExecutorFixed(ThreadPool::Options options)
@@ -80,6 +92,12 @@ Status ServiceExecutorFixed::start() {
     return Status::OK();
 }
 
+ServiceExecutorFixed* ServiceExecutorFixed::get(ServiceContext* ctx) {
+    auto& ref = getServiceExecutorFixed(ctx);
+    invariant(ref);
+    return ref.get();
+}
+
 Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
     auto waitForShutdown = [&]() mutable -> Status {
         stdx::unique_lock<Latch> lk(_mutex);
@@ -109,7 +127,7 @@ Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
     return waitForShutdown();
 }
 
-Status ServiceExecutorFixed::schedule(Task task, ScheduleFlags flags) {
+Status ServiceExecutorFixed::scheduleTask(Task task, ScheduleFlags flags) {
     if (!_canScheduleWork.load()) {
         return Status(ErrorCodes::ShutdownInProgress, "Executor is not running");
     }
@@ -149,9 +167,20 @@ Status ServiceExecutorFixed::schedule(Task task, ScheduleFlags flags) {
     return Status::OK();
 }
 
+void ServiceExecutorFixed::runOnDataAvailable(Session* session,
+                                              OutOfLineExecutor::Task onCompletionCallback) {
+    invariant(session);
+    session->waitForData().thenRunOn(shared_from_this()).getAsync(std::move(onCompletionCallback));
+}
+
 void ServiceExecutorFixed::appendStats(BSONObjBuilder* bob) const {
     *bob << kExecutorLabel << kExecutorName << kThreadsRunning
          << static_cast<int>(_numRunningExecutorThreads.load());
+}
+
+int ServiceExecutorFixed::getRecursionDepthForExecutorThread() const {
+    invariant(_executorContext);
+    return _executorContext->getRecursionDepth();
 }
 
 }  // namespace transport

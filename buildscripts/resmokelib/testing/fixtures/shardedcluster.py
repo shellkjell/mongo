@@ -11,7 +11,7 @@ from buildscripts.resmokelib import core
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib import logging
 from buildscripts.resmokelib import utils
-from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOS_BINARY
+from buildscripts.resmokelib.multiversionconstants import LAST_LTS_MONGOS_BINARY
 from buildscripts.resmokelib.testing.fixtures import interface
 from buildscripts.resmokelib.testing.fixtures import replicaset
 from buildscripts.resmokelib.testing.fixtures import standalone
@@ -242,6 +242,15 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         """Return the driver connection URL."""
         return "mongodb://" + self.get_internal_connection_string()
 
+    def get_node_info(self):
+        """Return a list of dicts of NodeInfo objects."""
+        output = []
+        for shard in self.shards:
+            output += shard.get_node_info()
+        for mongos in self.mongos:
+            output += mongos.get_node_info()
+        return output + self.configsvr.get_node_info()
+
     def _new_configsvr(self):
         """Return a replicaset.ReplicaSetFixture configured as the config server."""
 
@@ -343,9 +352,9 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         mongos_options = self.mongos_options.copy()
         mongos_options["configdb"] = self.configsvr.get_internal_connection_string()
 
-        # The last-stable binary is currently expected to live in '/data/multiversion', which is
+        # The last-lts binary is currently expected to live in '/data/multiversion', which is
         # part of the PATH.
-        mongos_executable = self.mongos_executable if self.mixed_bin_versions is None else LAST_STABLE_MONGOS_BINARY
+        mongos_executable = self.mongos_executable if self.mixed_bin_versions is None else LAST_LTS_MONGOS_BINARY
 
         return _MongoSFixture(mongos_logger, self.job_num, dbpath_prefix=self._dbpath_prefix,
                               mongos_executable=mongos_executable, mongos_options=mongos_options)
@@ -493,3 +502,8 @@ class _MongoSFixture(interface.Fixture):
     def get_driver_connection_url(self):
         """Return the driver connection URL."""
         return "mongodb://" + self.get_internal_connection_string()
+
+    def get_node_info(self):
+        """Return a list of NodeInfo objects."""
+        info = interface.NodeInfo(name=self.logger.name, port=self.port, pid=self.mongos.pid)
+        return [info]

@@ -307,7 +307,6 @@ void ShardingInitializationMongoD::shutDown(OperationContext* opCtx) {
     if (!shardingState->enabled())
         return;
 
-    grid->getExecutorPool()->shutdownAndJoin();
     grid->catalogClient()->shutDown(opCtx);
     grid->shardRegistry()->shutdown();
     _replicaSetChangeListener.reset();
@@ -469,7 +468,8 @@ void ShardingInitializationMongoD::updateShardIdentityConfigString(
     auto updateReq = UpdateRequest();
     updateReq.setNamespaceString(NamespaceString::kServerConfigurationNamespace);
     updateReq.setQuery(BSON("_id" << ShardIdentityType::IdName));
-    updateReq.setUpdateModification(updateObj);
+    updateReq.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(updateObj));
 
     try {
         AutoGetOrCreateDb autoDb(
@@ -535,7 +535,6 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
         std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     auto const service = opCtx->getServiceContext();
-
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
         if (storageGlobalParams.readOnly) {
             CatalogCacheLoader::set(service, std::make_unique<ReadOnlyCatalogCacheLoader>());
@@ -555,7 +554,7 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
 
     globalConnPool.addHook(new ShardingConnectionHook(makeEgressHooksList(service)));
 
-    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+    auto catalogCache = std::make_unique<CatalogCache>(service, CatalogCacheLoader::get(opCtx));
 
     // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
     // removed.

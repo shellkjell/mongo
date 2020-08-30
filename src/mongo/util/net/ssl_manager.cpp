@@ -40,11 +40,14 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/client/internal_auth.h"
 #include "mongo/config.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
 #include "mongo/util/net/ssl_options.h"
@@ -344,10 +347,72 @@ std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
     return *_manager;
 }
 
-void SSLManagerCoordinator::rotate() {}
+void logCert(const CertInformationToLog& cert, StringData certType, const int logNum) {
+    LOGV2(logNum,
+          "Certificate information",
+          "type"_attr = certType,
+          "subject"_attr = cert.subject.toString(),
+          "issuer"_attr = cert.issuer.toString(),
+          "thumbprint"_attr =
+              toHex(static_cast<const void*>(cert.thumbprint.data()), cert.thumbprint.size()),
+          "notValidBefore"_attr = cert.validityNotBefore.toString(),
+          "notValidAfter"_attr = cert.validityNotAfter.toString());
+}
+
+void logCRL(const CRLInformationToLog& crl, const int logNum) {
+    LOGV2(logNum,
+          "CRL information",
+          "thumbprint"_attr =
+              toHex(static_cast<const void*>(crl.thumbprint.data()), crl.thumbprint.size()),
+          "notValidBefore"_attr = crl.validityNotBefore.toString(),
+          "notValidAfter"_attr = crl.validityNotAfter.toString());
+}
+
+void logSSLInfo(const SSLInformationToLog& info) {
+    if (!(sslGlobalParams.sslPEMKeyFile.empty())) {
+        logCert(info.server, "Server", 4913010);
+    }
+    if (info.cluster.has_value()) {
+        logCert(info.cluster.get(), "Cluster", 4913011);
+    }
+    if (info.crl.has_value()) {
+        logCRL(info.crl.get(), 4913012);
+    }
+}
+
+void SSLManagerCoordinator::rotate() {
+    stdx::lock_guard lockGuard(_lock);
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
+
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 ||
+        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509) {
+        auth::setInternalUserAuthParams(
+            BSON(saslCommandMechanismFieldName
+                 << "MONGODB-X509" << saslCommandUserDBFieldName << "$external"
+                 << saslCommandUserFieldName
+                 << manager->getSSLConfiguration().clientSubjectName.toString()));
+    }
+
+    auto tl = getGlobalServiceContext()->getTransportLayer();
+    invariant(tl != nullptr);
+    uassertStatusOK(tl->rotateCertificates(manager, false));
+
+    std::shared_ptr<SSLManagerInterface> originalManager = *_manager;
+    _manager = manager;
+
+    LOGV2(4913400, "Successfully rotated X509 certificates.");
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+
+    originalManager->stopJobs();
+}
 
 SSLManagerCoordinator::SSLManagerCoordinator()
-    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {}
+    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+}
 
 void ClusterMemberDNOverride::append(OperationContext* opCtx,
                                      BSONObjBuilder& b,
@@ -561,7 +626,7 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
     return getTLSVersionCounts(serviceContext);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();

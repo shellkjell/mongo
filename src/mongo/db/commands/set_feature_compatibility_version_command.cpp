@@ -37,9 +37,9 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
+#include "mongo/db/commands/set_feature_compatibility_version_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -64,6 +64,9 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+using FCVP = FeatureCompatibilityVersionParser;
+using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
 
 namespace {
 
@@ -92,9 +95,66 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
     uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
 }
 
+Status validateDowngradeRequest(FeatureCompatibilityParams::Version actualVersion,
+                                FeatureCompatibilityParams::Version requestedVersion) {
+    if (actualVersion == FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest ||
+        actualVersion == FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest) {
+        return Status(ErrorCodes::IllegalOperation,
+                      "cannot downgrade featureCompatibilityVersion while a previous "
+                      "featureCompatibilityVersion upgrade has not completed.");
+    }
+
+    const auto lastLTSFCV = FeatureCompatibilityParams::kLastLTS;
+    const auto lastContFCV = FeatureCompatibilityParams::kLastContinuous;
+    if (lastLTSFCV == lastContFCV) {
+        return Status::OK();
+    }
+
+    if ((requestedVersion == lastLTSFCV &&
+         actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous) ||
+        (requestedVersion == lastContFCV &&
+         actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS)) {
+        return Status(ErrorCodes::IllegalOperation,
+                      str::stream()
+                          << "cannot downgrade featureCompatibilityVersion to "
+                          << FCVP::toString(requestedVersion)
+                          << " while a previous featureCompatibilityVersion downgrade to a "
+                             "different target version has not yet completed.");
+    }
+
+    // We don't support upgrading/downgrading between last-lts and last-continuous FCV.
+    if ((requestedVersion == lastLTSFCV && actualVersion == lastContFCV) ||
+        (requestedVersion == lastContFCV && actualVersion == lastLTSFCV)) {
+        return Status(ErrorCodes::IllegalOperation,
+                      str::stream() << "cannot set featureCompatibilityVersion to "
+                                    << FCVP::toString(requestedVersion)
+                                    << " while in featureCompatibilityVersion "
+                                    << FCVP::toString(actualVersion) << ".");
+    }
+
+    return Status::OK();
+}
+
+Status validateUpgradeRequest(FeatureCompatibilityParams::Version actualVersion,
+                              FeatureCompatibilityParams::Version requestedVersion) {
+    if (actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS ||
+        actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous) {
+        return Status(ErrorCodes::IllegalOperation,
+                      str::stream() << "cannot initiate featureCompatibilityVersion upgrade to "
+                                    << FCVP::kLatest
+                                    << " while a previous featureCompatibilityVersion downgrade to "
+                                    << FCVP::kLastLTS << " or " << FCVP::kLastContinuous
+                                    << " has not completed. Finish downgrade then upgrade to "
+                                    << FCVP::kLatest);
+    }
+
+    return Status::OK();
+}
+
 /**
- * Sets the minimum allowed version for the cluster. If it is 4.4, then the node should not
- * use 4.5.1 features.
+ * Sets the minimum allowed feature compatibility version for the cluster. The cluster should not
+ * use any new features introduced in binary versions that are newer than the feature compatibility
+ * version set.
  *
  * Format:
  * {
@@ -104,7 +164,7 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
 class SetFeatureCompatibilityVersionCommand : public BasicCommand {
 public:
     SetFeatureCompatibilityVersionCommand()
-        : BasicCommand(FeatureCompatibilityVersionCommandParser::kCommandName) {}
+        : BasicCommand(SetFeatureCompatibilityVersion::kCommandName) {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -119,14 +179,17 @@ public:
     }
 
     std::string help() const override {
-        using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the featureCompatibilityVersion exposed by this node. If set to '"
-          << FCVP::kVersion44 << "', then " << FCVP::kVersion451
-          << " features are disabled. If set to '" << FCVP::kVersion451 << "', then "
-          << FCVP::kVersion451
-          << " features are enabled, and all nodes in the cluster must be binary version "
-          << FCVP::kVersion451 << ". See "
+        h << "Set the featureCompatibilityVersion used by this cluster. If set to '"
+          << FCVP::kLastLTS << "', then features introduced in versions greater than '"
+          << FCVP::kLastLTS << "' will be disabled";
+        if (FCVP::kLastContinuous != FCVP::kLastLTS) {
+            h << " If set to '" << FCVP::kLastContinuous << "', then features introduced in '"
+              << FCVP::kLatest << "' will be disabled.";
+        }
+        h << " If set to '" << FCVP::kLatest << "', then '" << FCVP::kLatest
+          << "' features are enabled, and all nodes in the cluster must be binary version "
+          << FCVP::kLatest << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -167,32 +230,35 @@ public:
             CommandHelpers::appendCommandWCStatus(result, waitForWCStatus, res);
         });
 
-        {
-            // Acquire the global IX lock and then immediately release it to ensure this operation
-            // will be killed by the RstlKillOpThread during step-up or stepdown. Note that the
-            // RstlKillOpThread kills any operations on step-up or stepdown for which
-            // Locker::wasGlobalLockTakenInModeConflictingWithWrites() returns true.
-            Lock::GlobalLock lk(opCtx, MODE_IX);
-        }
+        // Ensure that this operation will be killed by the RstlKillOpThread during step-up or
+        // stepdown.
+        opCtx->setAlwaysInterruptAtStepDownOrUp();
 
         // Only allow one instance of setFeatureCompatibilityVersion to run at a time.
         invariant(!opCtx->lockState()->isLocked());
         Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
-        const auto requestedVersion = uassertStatusOK(
-            FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
-        ServerGlobalParams::FeatureCompatibility::Version actualVersion =
+        auto request = SetFeatureCompatibilityVersion::parse(
+            IDLParserErrorContext("setFeatureCompatibilityVersion"), cmdObj);
+        const auto requestedVersion = request.getCommandParameter();
+        const auto requestedVersionString = FCVP::serializeVersion(requestedVersion);
+        FeatureCompatibilityParams::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion451) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.5.1 while a previous "
-                    "featureCompatibilityVersion downgrade to 4.4 has not completed. Finish "
-                    "downgrade to 4.4, then upgrade to 4.5.1.",
-                    actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44);
+        if (request.getDowngradeOnDiskChanges() &&
+            requestedVersion != FeatureCompatibilityParams::kLastContinuous) {
+            std::stringstream downgradeOnDiskErrorSS;
+            downgradeOnDiskErrorSS
+                << "cannot set featureCompatibilityVersion to " << requestedVersionString
+                << " with '" << SetFeatureCompatibilityVersion::kDowngradeOnDiskChangesFieldName
+                << "' set to true. This is only allowed when downgrading to "
+                << FCVP::kLastContinuous;
+            uasserted(ErrorCodes::IllegalOperation, downgradeOnDiskErrorSS.str());
+        }
 
-            if (actualVersion == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
+        if (requestedVersion == FeatureCompatibilityParams::kLatest) {
+            uassertStatusOK(validateUpgradeRequest(actualVersion, requestedVersion));
+            if (actualVersion == FeatureCompatibilityParams::kLatest) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -200,14 +266,13 @@ public:
                 return true;
             }
 
-            FeatureCompatibilityVersion::setTargetUpgradeFrom(
-                opCtx, ServerGlobalParams::FeatureCompatibility::kLastLTS);
+            FeatureCompatibilityVersion::setTargetUpgradeFrom(opCtx, actualVersion);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.5.1 FCV and act accordingly.
+                //     upgrading to the latest FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
@@ -229,26 +294,17 @@ public:
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx,
-                        CommandHelpers::appendMajorityWriteConcern(
-                            CommandHelpers::appendPassthroughFields(
-                                cmdObj,
-                                BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                     << requestedVersion)))));
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(
-                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
-            uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 4.4 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.5.1 has not completed.",
-                    actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451);
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+        } else if (requestedVersion == FeatureCompatibilityParams::kLastLTS ||
+                   requestedVersion == FeatureCompatibilityParams::kLastContinuous) {
+            uassertStatusOK(validateDowngradeRequest(actualVersion, requestedVersion));
 
-            if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
+            if (actualVersion == FeatureCompatibilityParams::kLastLTS ||
+                actualVersion == FeatureCompatibilityParams::kLastContinuous) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -281,8 +337,7 @@ public:
                 "nodes");
             LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
 
-            FeatureCompatibilityVersion::setTargetDowngrade(
-                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
+            FeatureCompatibilityVersion::setTargetDowngrade(opCtx, requestedVersion);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
@@ -311,20 +366,31 @@ public:
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx,
-                        CommandHelpers::appendMajorityWriteConcern(
-                            CommandHelpers::appendPassthroughFields(
-                                cmdObj,
-                                BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                     << requestedVersion)))));
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(
-                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+
+            if (request.getDowngradeOnDiskChanges()) {
+                invariant(requestedVersion == FeatureCompatibilityParams::kLastContinuous);
+                _downgradeOnDiskChanges();
+                LOGV2(4875603, "Downgrade of on-disk format complete.");
+            }
         }
 
         return true;
+    }
+
+private:
+    /*
+     * Rolls back any upgraded on-disk changes to reflect the disk format of the last-continuous
+     * version.
+     */
+    void _downgradeOnDiskChanges() {
+        LOGV2(4975602,
+              "Downgrading on-disk format to reflect the last-continuous version.",
+              "last_continuous_version"_attr = FCVP::kLastContinuous);
     }
 
 } setFeatureCompatibilityVersionCommand;

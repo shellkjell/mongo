@@ -14,36 +14,42 @@ checkFCV(adminDB, latestFCV);
 
 // Updating the featureCompatibilityVersion document changes the featureCompatibilityVersion
 // server parameter.
-assert.commandWorked(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
-                                                   {$set: {version: lastStableFCV}}));
-checkFCV(adminDB, lastStableFCV);
+for (let oldVersion of [lastLTSFCV, lastContinuousFCV]) {
+    // Fully downgraded to oldVersion.
+    assert.commandWorked(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
+                                                       {$set: {version: oldVersion}}));
+    checkFCV(adminDB, oldVersion);
 
-assert.commandWorked(
-    adminDB.system.version.update({_id: "featureCompatibilityVersion"},
-                                  {$set: {version: lastStableFCV, targetVersion: latestFCV}}));
-checkFCV(adminDB, lastStableFCV, latestFCV);
+    // Upgrading to lastest.
+    assert.commandWorked(
+        adminDB.system.version.update({_id: "featureCompatibilityVersion"},
+                                      {$set: {version: oldVersion, targetVersion: latestFCV}}));
+    checkFCV(adminDB, oldVersion, latestFCV);
 
-assert.commandWorked(adminDB.system.version.update(
-    {_id: "featureCompatibilityVersion"},
-    {$set: {version: lastStableFCV, targetVersion: lastStableFCV, previousVersion: latestFCV}}));
-checkFCV(adminDB, lastStableFCV, lastStableFCV);
+    // Downgrading to oldVersion.
+    assert.commandWorked(adminDB.system.version.update(
+        {_id: "featureCompatibilityVersion"},
+        {$set: {version: oldVersion, targetVersion: oldVersion, previousVersion: latestFCV}}));
+    checkFCV(adminDB, oldVersion, oldVersion);
 
-// When present, "previousVersion" will always be the latestFCV.
-assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
-                                                        {$set: {previousVersion: lastStableFCV}}),
-                          4926901);
-checkFCV(adminDB, lastStableFCV, lastStableFCV);
+    // When present, "previousVersion" will always be the latestFCV.
+    assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
+                                                            {$set: {previousVersion: oldVersion}}),
+                              4926901);
+    checkFCV(adminDB, oldVersion, oldVersion);
 
-// Downgrading FCV must have a 'previousVersion' field.
-assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
-                                                        {$unset: {previousVersion: true}}),
-                          4926902);
-checkFCV(adminDB, lastStableFCV, lastStableFCV);
+    // Downgrading FCV must have a 'previousVersion' field.
+    assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
+                                                            {$unset: {previousVersion: true}}),
+                              4926902);
+    checkFCV(adminDB, oldVersion, oldVersion);
 
-assert.commandWorked(adminDB.system.version.update(
-    {_id: "featureCompatibilityVersion"},
-    {$set: {version: latestFCV}, $unset: {targetVersion: true, previousVersion: true}}));
-checkFCV(adminDB, latestFCV);
+    // Reset to latestFCV.
+    assert.commandWorked(adminDB.system.version.update(
+        {_id: "featureCompatibilityVersion"},
+        {$set: {version: latestFCV}, $unset: {targetVersion: true, previousVersion: true}}));
+    checkFCV(adminDB, latestFCV);
+}
 
 // Updating the featureCompatibilityVersion document with an invalid version fails.
 assert.writeErrorWithCode(
@@ -53,7 +59,12 @@ checkFCV(adminDB, latestFCV);
 
 // Updating the featureCompatibilityVersion document with an invalid targetVersion fails.
 assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
-                                                        {$set: {targetVersion: lastStableFCV}}),
+                                                        {$set: {targetVersion: lastLTSFCV}}),
+                          4926904);
+checkFCV(adminDB, latestFCV);
+
+assert.writeErrorWithCode(adminDB.system.version.update({_id: "featureCompatibilityVersion"},
+                                                        {$set: {targetVersion: lastContinuousFCV}}),
                           4926904);
 checkFCV(adminDB, latestFCV);
 

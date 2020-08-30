@@ -42,8 +42,10 @@
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/hasher.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/decimal128.h"
@@ -2044,8 +2046,8 @@ Expression::ComputedPaths ExpressionObject::getComputedPaths(const std::string& 
 /* --------------------- ExpressionFieldPath --------------------------- */
 
 // this is the old deprecated version only used by tests not using variables
-intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::create(ExpressionContext* const expCtx,
-                                                               const string& fieldPath) {
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::deprecatedCreate(
+    ExpressionContext* const expCtx, const string& fieldPath) {
     return new ExpressionFieldPath(expCtx, "CURRENT." + fieldPath, Variables::kRootId);
 }
 
@@ -2065,7 +2067,7 @@ intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(ExpressionContext*
         const StringData rawSD = raw;
         const StringData fieldPath = rawSD.substr(2);  // strip off $$
         const StringData varName = fieldPath.substr(0, fieldPath.find('.'));
-        Variables::validateNameForUserRead(varName);
+        variableValidation::validateNameForUserRead(varName);
         auto varId = vps.getVariable(varName);
         return new ExpressionFieldPath(expCtx, fieldPath.toString(), varId);
     } else {
@@ -2073,6 +2075,18 @@ intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::parse(ExpressionContext*
                                        "CURRENT." + raw.substr(1),  // strip the "$" prefix
                                        vps.getVariable("CURRENT"));
     }
+}
+
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::createPathFromString(
+    ExpressionContext* const expCtx, const string& raw, const VariablesParseState& vps) {
+    return new ExpressionFieldPath(expCtx, "CURRENT." + raw, vps.getVariable("CURRENT"));
+}
+intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::createVarFromString(
+    ExpressionContext* const expCtx, const string& raw, const VariablesParseState& vps) {
+    const auto rawSD = StringData{raw};
+    const StringData varName = rawSD.substr(0, rawSD.find('.'));
+    auto varId = vps.getVariable(varName);
+    return new ExpressionFieldPath(expCtx, raw, varId);
 }
 
 ExpressionFieldPath::ExpressionFieldPath(ExpressionContext* const expCtx,
@@ -2248,7 +2262,7 @@ intrusive_ptr<Expression> ExpressionFilter::parse(ExpressionContext* const expCt
     // If "as" is not specified, then use "this" by default.
     auto varName = asElem.eoo() ? "this" : asElem.str();
 
-    Variables::validateNameForUserWrite(varName);
+    variableValidation::validateNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
     // Parse "cond", has access to "as" variable.
@@ -2378,7 +2392,7 @@ intrusive_ptr<Expression> ExpressionLet::parse(ExpressionContext* const expCtx,
     std::vector<Variables::Id> orderedVariableIds;
     for (auto&& varElem : varsObj) {
         const string varName = varElem.fieldName();
-        Variables::validateNameForUserWrite(varName);
+        variableValidation::validateNameForUserWrite(varName);
         Variables::Id id = vpsSub.defineVariable(varName);
 
         orderedVariableIds.push_back(id);
@@ -2490,7 +2504,7 @@ intrusive_ptr<Expression> ExpressionMap::parse(ExpressionContext* const expCtx,
     // If "as" is not specified, then use "this" by default.
     auto varName = asElem.eoo() ? "this" : asElem.str();
 
-    Variables::validateNameForUserWrite(varName);
+    variableValidation::validateNameForUserWrite(varName);
     Variables::Id varId = vpsSub.defineVariable(varName);
 
     // parse "in"
@@ -6481,4 +6495,32 @@ void ExpressionRandom::_doAddDependencies(DepsTracker* deps) const {
 Value ExpressionRandom::serialize(const bool explain) const {
     return Value(DOC(getOpName() << Document()));
 }
+
+/* ------------------------- ExpressionToHashedIndexKey -------------------------- */
+REGISTER_EXPRESSION(toHashedIndexKey, ExpressionToHashedIndexKey::parse);
+
+boost::intrusive_ptr<Expression> ExpressionToHashedIndexKey::parse(ExpressionContext* const expCtx,
+                                                                   BSONElement expr,
+                                                                   const VariablesParseState& vps) {
+    return make_intrusive<ExpressionToHashedIndexKey>(expCtx, parseOperand(expCtx, expr, vps));
+}
+
+Value ExpressionToHashedIndexKey::evaluate(const Document& root, Variables* variables) const {
+    Value inpVal(_children[0]->evaluate(root, variables));
+    if (inpVal.missing()) {
+        inpVal = Value(BSONNULL);
+    }
+
+    return Value(BSONElementHasher::hash64(BSON("" << inpVal).firstElement(),
+                                           BSONElementHasher::DEFAULT_HASH_SEED));
+}
+
+Value ExpressionToHashedIndexKey::serialize(bool explain) const {
+    return Value(DOC("$toHashedIndexKey" << _children[0]->serialize(explain)));
+}
+
+void ExpressionToHashedIndexKey::_doAddDependencies(DepsTracker* deps) const {
+    // Nothing to do
+}
+
 }  // namespace mongo

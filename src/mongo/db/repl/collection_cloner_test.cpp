@@ -31,9 +31,11 @@
 
 #include <vector>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/repl/cloner_test_fixture.h"
 #include "mongo/db/repl/collection_cloner.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
@@ -61,6 +63,7 @@ public:
 protected:
     void setUp() override {
         ClonerTestFixture::setUp();
+        _sharedData = std::make_unique<InitialSyncSharedData>(kInitialRollbackId, Days(1), &_clock);
         _collectionStats = std::make_shared<CollectionMockStats>();
         _standardCreateCollectionFn = [this](const NamespaceString& nss,
                                              const CollectionOptions& options,
@@ -78,11 +81,12 @@ protected:
         };
         _storageInterface.createCollectionForBulkFn = _standardCreateCollectionFn;
 
+
         _mockClient->setWireVersions(WireVersion::RESUMABLE_INITIAL_SYNC,
                                      WireVersion::RESUMABLE_INITIAL_SYNC);
         _mockServer->assignCollectionUuid(_nss.ns(), _collUuid);
         _mockServer->setCommandReply("replSetGetRBID",
-                                     BSON("ok" << 1 << "rbid" << _sharedData->getRollBackId()));
+                                     BSON("ok" << 1 << "rbid" << getSharedData()->getRollBackId()));
     }
     std::unique_ptr<CollectionCloner> makeCollectionCloner(
         CollectionOptions options = CollectionOptions()) {
@@ -90,7 +94,7 @@ protected:
         _options = options;
         return std::make_unique<CollectionCloner>(_nss,
                                                   options,
-                                                  _sharedData.get(),
+                                                  getSharedData(),
                                                   _source,
                                                   _mockClient.get(),
                                                   &_storageInterface,
@@ -111,6 +115,10 @@ protected:
 
     BSONObj& getIdIndexSpec(CollectionCloner* cloner) {
         return cloner->_idIndexSpec;
+    }
+
+    InitialSyncSharedData* getSharedData() {
+        return checked_cast<InitialSyncSharedData*>(_sharedData.get());
     }
 
     std::shared_ptr<CollectionMockStats> _collectionStats;  // Used by the _loader.
@@ -142,8 +150,8 @@ class CollectionClonerTestNonResumable : public CollectionClonerTest {
         // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
         _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
                                      WireVersion::SHARDED_TRANSACTIONS);
-        stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
-        _sharedData->setSyncSourceWireVersion(lk, WireVersion::SHARDED_TRANSACTIONS);
+        stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
+        getSharedData()->setSyncSourceWireVersion(lk, WireVersion::SHARDED_TRANSACTIONS);
     }
 };
 
@@ -328,6 +336,36 @@ TEST_F(CollectionClonerTestResumable, InsertDocumentsSingleBatch) {
 
     auto stats = cloner->getStats();
     ASSERT_EQUALS(1u, stats.receivedBatches);
+}
+
+TEST_F(CollectionClonerTestResumable, BatchSizeStoredInConstructor) {
+    auto batchSizeDefault = collectionClonerBatchSize;
+    collectionClonerBatchSize = 3;
+    ON_BLOCK_EXIT([&]() { collectionClonerBatchSize = batchSizeDefault; });
+
+    // Set up data for preliminary stages.
+    _mockServer->setCommandReply("count", createCountResponse(2));
+    _mockServer->setCommandReply("listIndexes",
+                                 createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+
+    // Set up documents to be returned from upstream node. It should take 3 batches to clone the
+    // documents.
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 6));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 7));
+
+    auto cloner = makeCollectionCloner();
+    ASSERT_OK(cloner->run());
+
+    ASSERT_EQUALS(7, _collectionStats->insertCount);
+    ASSERT_TRUE(_collectionStats->commitCalled);
+
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(3u, stats.receivedBatches);
 }
 
 TEST_F(CollectionClonerTestResumable, InsertDocumentsMultipleBatches) {

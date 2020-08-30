@@ -40,7 +40,6 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/unittest/log_test.h"
 
@@ -354,7 +353,8 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, const BSONObj& oField) {
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
+                      boost::none,   // post-image optime
+                      boost::none);  // ShardId of resharding recipient
 }
 
 TEST_F(ApplyOpsTest, ExtractOperationsReturnsTypeMismatchIfNotCommand) {

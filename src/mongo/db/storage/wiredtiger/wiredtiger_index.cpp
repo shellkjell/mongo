@@ -38,6 +38,7 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -236,12 +237,21 @@ int WiredTigerIndex::Create(OperationContext* opCtx,
     return s->create(s, uri.c_str(), config.c_str());
 }
 
+int WiredTigerIndex::Drop(OperationContext* opCtx, const std::string& uri) {
+    WiredTigerSession session(WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn());
+    WT_SESSION* s = session.getSession();
+
+    return s->drop(s, uri.c_str(), nullptr);
+}
+
 WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                                  const std::string& uri,
+                                 StringData ident,
                                  const IndexDescriptor* desc,
                                  KVPrefix prefix,
                                  bool isReadOnly)
-    : SortedDataInterface(_handleVersionInfo(ctx, uri, desc, isReadOnly),
+    : SortedDataInterface(ident,
+                          _handleVersionInfo(ctx, uri, desc, isReadOnly),
                           Ordering::make(desc->keyPattern())),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
@@ -287,7 +297,7 @@ void WiredTigerIndex::unindex(OperationContext* opCtx,
 
 void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                                    long long* numKeysOut,
-                                   ValidateResults* fullResults) const {
+                                   IndexValidateResults* fullResults) const {
     dassert(opCtx->lockState()->isReadLocked());
     if (fullResults && !WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->isEphemeral()) {
         int err = WiredTigerUtil::verifyTable(opCtx, _uri, &(fullResults->errors));
@@ -1366,10 +1376,11 @@ private:
 
 WiredTigerIndexUnique::WiredTigerIndexUnique(OperationContext* ctx,
                                              const std::string& uri,
+                                             StringData ident,
                                              const IndexDescriptor* desc,
                                              KVPrefix prefix,
                                              bool isReadOnly)
-    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly), _partial(desc->isPartial()) {}
+    : WiredTigerIndex(ctx, uri, ident, desc, prefix, isReadOnly), _partial(desc->isPartial()) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexUnique::newCursor(
     OperationContext* opCtx, bool forward) const {
@@ -1801,10 +1812,11 @@ void WiredTigerIndexUnique::_unindexTimestampSafe(OperationContext* opCtx,
 
 WiredTigerIndexStandard::WiredTigerIndexStandard(OperationContext* ctx,
                                                  const std::string& uri,
+                                                 StringData ident,
                                                  const IndexDescriptor* desc,
                                                  KVPrefix prefix,
                                                  bool isReadOnly)
-    : WiredTigerIndex(ctx, uri, desc, prefix, isReadOnly) {}
+    : WiredTigerIndex(ctx, uri, ident, desc, prefix, isReadOnly) {}
 
 std::unique_ptr<SortedDataInterface::Cursor> WiredTigerIndexStandard::newCursor(
     OperationContext* opCtx, bool forward) const {

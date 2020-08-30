@@ -510,7 +510,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     // 3) Check if we can create the index without handing control to the IndexBuildsCoordinator.
     OptionalCollectionUUID collectionUUID;
     {
-        Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
+        Lock::DBLock dbLock(opCtx, ns.db(), MODE_IS);
         checkDatabaseShardingState(opCtx, ns);
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
             uasserted(ErrorCodes::NotMaster,
@@ -518,12 +518,14 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         }
 
         bool indexExists = writeConflictRetry(opCtx, "createCollectionWithIndexes", ns.ns(), [&] {
-            AutoGetCollection autoColl(opCtx, ns, MODE_IX);
+            AutoGetCollection autoColl(opCtx, ns, MODE_IS);
             auto collection = autoColl.getCollection();
 
             // Before potentially taking an exclusive collection lock, check if all indexes already
             // exist while holding an intent lock.
             if (collection && indexesAlreadyExist(opCtx, collection, specs, &result)) {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
                 return true;
             }
 
@@ -582,6 +584,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
           "firstIndex"_attr = specs[0][IndexDescriptor::kIndexNameFieldName]);
     hangCreateIndexesBeforeStartingIndexBuild.pauseWhileSet(opCtx);
 
+    bool shouldContinueInBackground = false;
     try {
         auto buildIndexFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
             opCtx, dbname, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
@@ -608,9 +611,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                 // background and will complete when this node receives a commitIndexBuild oplog
                 // entry from the new primary.
                 if (ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
-                    LOGV2(20442,
-                          "Index build: ignoring interrupt and continuing in background",
-                          "buildUUID"_attr = buildUUID);
+                    shouldContinueInBackground = true;
                     throw;
                 }
             }
@@ -629,11 +630,17 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
                 std::string abortReason(str::stream() << "Index build aborted: " << buildUUID
                                                       << ": " << interruptionEx.toString());
-                indexBuildsCoord->abortIndexBuildByBuildUUID(
-                    abortCtx.get(), buildUUID, IndexBuildAction::kPrimaryAbort, abortReason);
-                LOGV2(20443,
-                      "Index build: aborted due to interruption",
-                      "buildUUID"_attr = buildUUID);
+                if (indexBuildsCoord->abortIndexBuildByBuildUUID(
+                        abortCtx.get(), buildUUID, IndexBuildAction::kPrimaryAbort, abortReason)) {
+                    LOGV2(20443,
+                          "Index build: aborted due to interruption",
+                          "buildUUID"_attr = buildUUID);
+                } else {
+                    // The index build may already be in the midst of tearing down.
+                    LOGV2(5010500,
+                          "Index build: failed to abort index build",
+                          "buildUUID"_attr = buildUUID);
+                }
             }
             throw;
         } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
@@ -646,18 +653,24 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // background and will complete when this node receives a commitIndexBuild oplog
             // entry from the new primary.
             if (IndexBuildProtocol::kTwoPhase == protocol) {
-                LOGV2(20445,
-                      "Index build: ignoring interrupt and continuing in background",
-                      "buildUUID"_attr = buildUUID);
+                shouldContinueInBackground = true;
                 throw;
             }
 
             std::string abortReason(str::stream() << "Index build aborted: " << buildUUID << ": "
                                                   << ex.toString());
-            indexBuildsCoord->abortIndexBuildByBuildUUID(
-                opCtx, buildUUID, IndexBuildAction::kPrimaryAbort, abortReason);
-            LOGV2(
-                20446, "Index build: aborted due to NotMaster error", "buildUUID"_attr = buildUUID);
+            if (indexBuildsCoord->abortIndexBuildByBuildUUID(
+                    opCtx, buildUUID, IndexBuildAction::kPrimaryAbort, abortReason)) {
+                LOGV2(20446,
+                      "Index build: aborted due to NotMaster error",
+                      "buildUUID"_attr = buildUUID);
+            } else {
+                // The index build may already be in the midst of tearing down.
+                LOGV2(5010501,
+                      "Index build: failed to abort index build",
+                      "buildUUID"_attr = buildUUID);
+            }
+
             throw;
         }
 
@@ -677,8 +690,15 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             return true;
         }
 
+        if (shouldContinueInBackground) {
+            LOGV2(4760400,
+                  "Index build: ignoring interrupt and continuing in background",
+                  "buildUUID"_attr = buildUUID);
+        } else {
+            LOGV2(20449, "Index build: failed", "buildUUID"_attr = buildUUID, "error"_attr = ex);
+        }
+
         // All other errors should be forwarded to the caller with index build information included.
-        LOGV2(20449, "Index build: failed", "buildUUID"_attr = buildUUID, "error"_attr = ex);
         ex.addContext(str::stream() << "Index build failed: " << buildUUID << ": Collection " << ns
                                     << " ( " << *collectionUUID << " )");
 
@@ -708,6 +728,10 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 class CmdCreateIndex : public ErrmsgCommandDeprecated {
 public:
     CmdCreateIndex() : ErrmsgCommandDeprecated(kCommandName) {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;

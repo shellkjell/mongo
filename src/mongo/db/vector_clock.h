@@ -31,24 +31,20 @@
 
 #include <array>
 
-#include "mongo/client/query.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/transport/session.h"
 
-
 namespace mongo {
-
-class VectorClockMutable;
 
 /**
  * The VectorClock service provides a collection of cluster-wide logical clocks (including the
  * clusterTime), that are used to provide causal-consistency to various other services.
  */
 class VectorClock {
-public:
+protected:
     enum class Component : uint8_t {
         ClusterTime = 0,
         ConfigTime = 1,
@@ -56,7 +52,6 @@ public:
         _kNumComponents = 3,
     };
 
-protected:
     template <typename T>
     class ComponentArray
         : public std::array<T, static_cast<unsigned long>(Component::_kNumComponents)> {
@@ -80,9 +75,36 @@ protected:
 
     using LogicalTimeArray = ComponentArray<LogicalTime>;
 
+    struct component_comparator {
+        bool operator()(const Component& c0, const Component& c1) const {
+            return static_cast<uint8_t>(c0) < static_cast<uint8_t>(c1);
+        }
+    };
+
+    using ComponentSet = std::set<Component, component_comparator>;
+
 public:
     class VectorTime {
     public:
+        explicit VectorTime(LogicalTimeArray time) : _time(std::move(time)) {}
+        VectorTime() = default;
+
+        LogicalTime clusterTime() const& {
+            return _time[Component::ClusterTime];
+        }
+
+        LogicalTime configTime() const& {
+            return _time[Component::ConfigTime];
+        }
+
+        LogicalTime topologyTime() const& {
+            return _time[Component::TopologyTime];
+        }
+
+        LogicalTime clusterTime() const&& = delete;
+        LogicalTime configTime() const&& = delete;
+        LogicalTime topologyTime() const&& = delete;
+
         LogicalTime operator[](Component component) const {
             return _time[component];
         }
@@ -90,9 +112,7 @@ public:
     private:
         friend class VectorClock;
 
-        explicit VectorTime(LogicalTimeArray time) : _time(time) {}
-
-        const LogicalTimeArray _time;
+        LogicalTimeArray _time;
     };
 
     static constexpr char kClusterTimeFieldName[] = "$clusterTime";
@@ -103,6 +123,7 @@ public:
     // implementation.
     static VectorClock* get(ServiceContext* service);
     static VectorClock* get(OperationContext* ctx);
+
     static void registerVectorClockOnServiceContext(ServiceContext* service,
                                                     VectorClock* vectorClock);
 
@@ -119,6 +140,7 @@ public:
     bool gossipOut(OperationContext* opCtx,
                    BSONObjBuilder* outMessage,
                    const transport::Session::TagMask defaultClientSessionTags = 0) const;
+
     /**
      * Read the necessary fields from inMessage in order to update the current time, based on this
      * message received from another node, taking into account if the gossiping is from an internal
@@ -134,34 +156,28 @@ public:
      */
     bool isEnabled() const;
 
-    /*
-     * Methods to save/recover the the vector clock to/from persistent storage. Subclasses are
-     * eventually expected to override these methods to provide persistence mechanisms. Default
-     * implementations do nothing.
-     */
-    virtual SharedSemiFuture<void> persist(OperationContext* opCtx) {
-        return SharedSemiFuture<void>();
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    // The group of methods below is only used for unit-testing
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    void advanceClusterTime_forTest(LogicalTime newTime) {
+        _advanceTime_forTest(Component::ClusterTime, newTime);
     }
-    virtual SharedSemiFuture<void> recover(OperationContext* opCtx) {
-        return SharedSemiFuture<void>();
+
+    void advanceConfigTime_forTest(LogicalTime newTime) {
+        _advanceTime_forTest(Component::ConfigTime, newTime);
     }
-    virtual void waitForInMemoryVectorClockToBePersisted(OperationContext* opCtx) {}
-    virtual void waitForVectorClockToBeRecovered(OperationContext* opCtx) {}
+
+    void advanceTopologyTime_forTest(LogicalTime newTime) {
+        _advanceTime_forTest(Component::TopologyTime, newTime);
+    }
 
     void resetVectorClock_forTest();
-    void advanceTime_forTest(Component component, LogicalTime newTime);
-
-    // Query to use when reading/writing the vector clock state document.
-    static const Query& stateQuery();
-
-    // The _id value of the vector clock singleton document.
-    static constexpr StringData kDocIdKey = "vectorClockState"_sd;
 
 protected:
     class ComponentFormat {
-
     public:
-        ComponentFormat(std::string fieldName) : _fieldName(fieldName) {}
+        ComponentFormat(std::string fieldName) : _fieldName(std::move(fieldName)) {}
         virtual ~ComponentFormat() = default;
 
         // Returns true if the time was output, false otherwise.
@@ -212,46 +228,32 @@ protected:
      */
     static bool _lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks);
 
+    /**
+     * Returns the set of components that need to be gossiped to a node internal to the cluster.
+     */
+    virtual ComponentSet _gossipOutInternal() const = 0;
 
     /**
-     * Adds the necessary fields to outMessage to gossip the given time to a node internal to the
-     * cluster.  Returns true if the ClusterTime was output into outMessage, or false otherwise.
+     * As for _gossipOutInternal, except for the components to be sent to a client external to the
+     * cluster, eg. a driver or user client. By default, just the ClusterTime is gossiped.
      */
-    virtual bool _gossipOutInternal(OperationContext* opCtx,
-                                    BSONObjBuilder* out,
-                                    const LogicalTimeArray& time) const = 0;
+    virtual ComponentSet _gossipOutExternal() const {
+        return ComponentSet{Component::ClusterTime};
+    }
 
     /**
-     * As for _gossipOutInternal, except for an outMessage to be sent to a client external to the
-     * cluster, eg. a driver or user client.
+     * Returns the set of components that should be processed during gossiping in of messages from
+     * internal clients.
      */
-    virtual bool _gossipOutExternal(OperationContext* opCtx,
-                                    BSONObjBuilder* out,
-                                    const LogicalTimeArray& time) const = 0;
+    virtual ComponentSet _gossipInInternal() const = 0;
 
     /**
-     * Reads the necessary fields from the BSONObj, which has come from a node internal to the
-     * cluster, and returns an array of LogicalTimes for each component present in the BSONObj.
-     *
-     * This array is suitable for passing to _advanceTime(), in order to monotonically increase
-     * any Component times that are larger than the current time.  Since the times in
-     * LogicalTimeArray are default constructed (ie. to Timestamp(0, 0)), any fields not present
-     * in the input BSONObj won't be advanced.
-     *
-     * The couldBeUnauthenticated parameter is used to indicate if the source of the input BSONObj
-     * is an incoming request for a command that can be run by an unauthenticated client.
+     * As for _gossipInInternal, except from a client external to the cluster, eg. a driver or user
+     * client. By default, just the ClusterTime is gossiped.
      */
-    virtual LogicalTimeArray _gossipInInternal(OperationContext* opCtx,
-                                               const BSONObj& in,
-                                               bool couldBeUnauthenticated) = 0;
-
-    /**
-     * As for _gossipInInternal, except for an input BSONObj from a client external to the cluster,
-     * eg. a driver or user client.
-     */
-    virtual LogicalTimeArray _gossipInExternal(OperationContext* opCtx,
-                                               const BSONObj& in,
-                                               bool couldBeUnauthenticated) = 0;
+    virtual ComponentSet _gossipInExternal() const {
+        return ComponentSet{Component::ClusterTime};
+    }
 
     /**
      * Whether or not it's permissable to refresh external state (eg. updating gossip signing keys)
@@ -260,8 +262,42 @@ protected:
     virtual bool _permitRefreshDuringGossipOut() const = 0;
 
     /**
-     * Called by sub-classes in order to actually output a Component time to the output
-     * BSONObjBuilder, using the appropriate field name and representation for that Component.
+     * For each component in the LogicalTimeArray, sets the current time to newTime if the newTime >
+     * current time and it passes the rate check.  If any component fails the rate check, then this
+     * function uasserts on the first such component (without setting any current times).
+     */
+    void _advanceTime(LogicalTimeArray&& newTime);
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    // The group of methods below is only used for unit-testing
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    void _advanceTime_forTest(Component component, LogicalTime newTime);
+
+    // Initialised only once, when the specific vector clock instance gets instantiated on the
+    // service context
+    ServiceContext* _service{nullptr};
+
+    // Protects the fields below
+    //
+    // Note that ConfigTime is advanced under the ReplicationCoordinator mutex, so to avoid
+    // potential deadlocks the ReplicationCoordator mutex should never be acquired whilst the
+    // VectorClock mutex is held.
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("VectorClock::_mutex");
+
+    bool _isEnabled{true};
+
+    LogicalTimeArray _vectorTime;
+
+private:
+    class PlainComponentFormat;
+    class SignedComponentFormat;
+    template <class ActualFormat>
+    class OnlyOutOnNewFCVComponentFormat;
+
+    /**
+     * Called in order to output a Component time to the passed BSONObjBuilder, using the
+     * appropriate field name and representation for that Component.
      *
      * Returns true if the component is ClusterTime and it was output, or false otherwise.
      */
@@ -271,40 +307,14 @@ protected:
                              Component component) const;
 
     /**
-     * Called by sub-classes in order to actually input a Component time into the given
-     * LogicalTimeArray from the given BSONObj, using the appropriate field name and representation
-     * for that Component.
+     * Called in order to input a Component time into the given LogicalTimeArray from the given
+     * BSONObj, using the appropriate field name and representation for that Component.
      */
     void _gossipInComponent(OperationContext* opCtx,
                             const BSONObj& in,
                             bool couldBeUnauthenticated,
                             LogicalTimeArray* newTime,
                             Component component);
-
-    /**
-     * For each component in the LogicalTimeArray, sets the current time to newTime if the newTime >
-     * current time and it passes the rate check.  If any component fails the rate check, then this
-     * function uasserts on the first such component (without setting any current times).
-     */
-    void _advanceTime(LogicalTimeArray&& newTime);
-
-    ServiceContext* _service{nullptr};
-
-    // The mutex protects _vectorTime and _isEnabled.
-    //
-    // Note that ConfigTime is advanced under the ReplicationCoordinator mutex, so to avoid
-    // potential deadlocks the ReplicationCoordator mutex should never be acquired whilst the
-    // VectorClock mutex is held.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("VectorClock::_mutex");
-
-    LogicalTimeArray _vectorTime;
-    bool _isEnabled{true};
-
-private:
-    class PlainComponentFormat;
-    class SignedComponentFormat;
-    template <class ActualFormat>
-    class OnlyOutOnNewFCVComponentFormat;
 
     static const ComponentArray<std::unique_ptr<ComponentFormat>> _gossipFormatters;
 };

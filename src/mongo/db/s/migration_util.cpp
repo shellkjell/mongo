@@ -57,6 +57,7 @@
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -168,7 +169,7 @@ void retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
 
             {
                 stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillable(lk);
+                newClient->setSystemOperationKillableByStepdown(lk);
             }
 
             auto newOpCtx = newClient->makeOperationContext();
@@ -292,7 +293,7 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             ThreadClient tc(kRangeDeletionThreadName, serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
             auto uniqueOpCtx = tc->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
@@ -378,7 +379,7 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             ThreadClient tc(kRangeDeletionThreadName, serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
             auto uniqueOpCtx = tc->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
@@ -419,7 +420,7 @@ void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
             ThreadClient tc("ResubmitRangeDeletions", serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
 
             auto opCtx = tc->makeOperationContext();
@@ -490,18 +491,6 @@ void submitOrphanRanges(OperationContext* opCtx, const NamespaceString& nss, con
     try {
 
         onShardVersionMismatch(opCtx, nss, boost::none);
-        {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-            auto csr = CollectionShardingRuntime::get(opCtx, nss);
-            auto metadata = csr->getCurrentMetadataIfKnown();
-            if (!metadata || !metadata->isSharded()) {
-                return;
-            }
-            // We clear the list of receiving chunks to ensure that a RangeDeletionTask submitted by
-            // this setFCV command cannot be blocked behind a chunk received as a part of a
-            // migration that completed on the recipient (this node) but failed to commit.
-            csr->clearReceivingChunks();
-        }
 
         LOGV2_DEBUG(22031,
                     2,
@@ -678,8 +667,9 @@ void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                              const UUID& migrationId) {
     write_ops::Update updateOp(NamespaceString::kRangeDeletionNamespace);
     auto queryFilter = BSON(RangeDeletionTask::kIdFieldName << migrationId);
-    auto updateModification = write_ops::UpdateModification(
-        BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << "")));
+    auto updateModification =
+        write_ops::UpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(
+            BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << ""))));
     write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
     updateEntry.setMulti(false);
     updateEntry.setUpsert(false);
@@ -711,7 +701,8 @@ void advanceTransactionOnRecipient(OperationContext* opCtx,
     write_ops::Update updateOp(NamespaceString::kServerConfigurationNamespace);
     auto queryFilter = BSON("_id"
                             << "migrationCoordinatorStats");
-    auto updateModification = write_ops::UpdateModification(BSON("$inc" << BSON("count" << 1)));
+    auto updateModification = write_ops::UpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(BSON("$inc" << BSON("count" << 1))));
 
     write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
     updateEntry.setMulti(false);
@@ -748,6 +739,11 @@ void markAsReadyRangeDeletionTaskLocally(OperationContext* opCtx, const UUID& mi
 }
 
 void deleteMigrationCoordinatorDocumentLocally(OperationContext* opCtx, const UUID& migrationId) {
+    // Before deleting the migration coordinator document, ensure that in the case of a crash, the
+    // node will start-up from at least the configTime, which it obtained as part of recovery of the
+    // shardVersion, which will ensure that it will see at least the same shardVersion.
+    VectorClockMutable::get(opCtx)->waitForDurableConfigTime().get(opCtx);
+
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.remove(opCtx,
@@ -788,15 +784,25 @@ void ensureChunkVersionIsGreaterThan(OperationContext* opCtx,
 }
 
 void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
-    LOGV2_DEBUG(4798510, 2, "Starting migration coordinator stepup recovery");
+    LOGV2_DEBUG(4798510, 2, "Starting migration coordinator step-up recovery");
 
     unsigned long long unfinishedMigrationsCount = 0;
+
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
-    Query query;
     store.forEach(opCtx,
-                  query,
+                  Query{},
                   [&opCtx, &unfinishedMigrationsCount](const MigrationCoordinatorDocument& doc) {
+                      // MigrationCoordinators are only created under the MigrationBlockingGuard,
+                      // which means that only one can possibly exist on an instance at a time.
+                      // Furthermore, recovery of an incomplete MigrationCoordator also acquires the
+                      // MigrationBlockingGuard. Because of this it is not possible to have more
+                      // than one unfinished migration.
+                      invariant(unfinishedMigrationsCount == 0,
+                                str::stream()
+                                    << "Upon step-up a second migration coordinator was found"
+                                    << redact(doc.toBSON()));
+
                       unfinishedMigrationsCount++;
                       LOGV2_DEBUG(4798511,
                                   3,
@@ -804,19 +810,25 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                                   "migrationCoordinatorDoc"_attr = redact(doc.toBSON()),
                                   "unfinishedMigrationsCount"_attr = unfinishedMigrationsCount);
 
-                      const auto nss = doc.getNss();
+                      const auto& nss = doc.getNss();
+
                       {
-                          AutoGetCollection autoColl(opCtx, nss, MODE_X);
-                          CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata();
+                          AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+                          CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
                       }
 
-                      const auto serviceContext = opCtx->getServiceContext();
+                      auto mbg = std::make_shared<MigrationBlockingGuard>(
+                          opCtx,
+                          str::stream() << "Recovery of migration session "
+                                        << doc.getMigrationSessionId().toString()
+                                        << " on collection " << nss);
+
                       ExecutorFuture<void>(getMigrationUtilExecutor())
-                          .then([serviceContext, nss] {
+                          .then([serviceContext = opCtx->getServiceContext(), nss, mbg] {
                               ThreadClient tc("TriggerMigrationRecovery", serviceContext);
                               {
                                   stdx::lock_guard<Client> lk(*tc.get());
-                                  tc->setSystemOperationKillable(lk);
+                                  tc->setSystemOperationKillableByStepdown(lk);
                               }
 
                               auto opCtx = tc->makeOperationContext();
@@ -838,9 +850,10 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
 
     ShardingStatistics::get(opCtx).unfinishedMigrationFromPreviousPrimary.store(
         unfinishedMigrationsCount);
+
     LOGV2_DEBUG(4798513,
                 2,
-                "Finished migration coordinator stepup recovery",
+                "Finished migration coordinator step-up recovery",
                 "unfinishedMigrationsCount"_attr = unfinishedMigrationsCount);
 }
 

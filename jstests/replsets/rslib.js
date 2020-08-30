@@ -7,7 +7,6 @@ var getLeastRecentOp;
 var waitForAllMembers;
 var reconfig;
 var awaitOpTime;
-var startSetIfSupportsReadMajority;
 var waitUntilAllNodesCaughtUp;
 var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
@@ -173,7 +172,7 @@ waitForAllMembers = function(master, timeout) {
     assert.soon(function() {
         var state = null;
         try {
-            state = master.getSisterDB("admin").runCommand({replSetGetStatus: 1});
+            state = master.getSiblingDB("admin").runCommand({replSetGetStatus: 1});
             failCount = 0;
         } catch (e) {
             // Connection can get reset on replica set failover causing a socket exception
@@ -506,19 +505,6 @@ waitForState = function(node, state) {
 };
 
 /**
- * Starts each node in the given replica set if the storage engine supports readConcern
- *'majority'.
- * Returns true if the replica set was started successfully and false otherwise.
- *
- * @param replSetTest - The instance of {@link ReplSetTest} to start
- * @param options - The options passed to {@link ReplSetTest.startSet}
- */
-startSetIfSupportsReadMajority = function(replSetTest, options) {
-    replSetTest.startSet(options);
-    return replSetTest.nodes[0].adminCommand("serverStatus").storageEngine.supportsCommittedReads;
-};
-
-/**
  * Performs a reInitiate() call on 'replSetTest', ignoring errors that are related to an aborted
  * secondary member. All other errors are rethrown.
  */
@@ -694,7 +680,8 @@ stopReplicationAndEnforceNewPrimaryToCatchUp = function(rst, node) {
     const latestOpOnOldPrimary = getLatestOp(oldPrimary);
 
     // New primary wins immediately, but needs to catch up.
-    const newPrimary = rst.stepUpNoAwaitReplication(node);
+    const newPrimary =
+        rst.stepUp(node, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
     const latestOpOnNewPrimary = getLatestOp(newPrimary);
     // Check this node is not writable.
     assert.eq(newPrimary.getDB("test").isMaster().ismaster, false);

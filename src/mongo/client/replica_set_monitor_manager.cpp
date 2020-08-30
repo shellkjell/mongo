@@ -51,6 +51,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 
@@ -89,7 +90,7 @@ Status ReplicaSetMonitorManagerNetworkConnectionHook::validateHost(
                 try {
                     if (isMasterReply.status.isOK()) {
                         publisher->onServerHandshakeCompleteEvent(
-                            isMasterReply.elapsedMillis.get(), remoteHost, isMasterReply.data);
+                            *isMasterReply.elapsed, remoteHost, isMasterReply.data);
                     } else {
                         publisher->onServerHandshakeFailedEvent(
                             remoteHost, isMasterReply.status, isMasterReply.data);
@@ -197,6 +198,7 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const
         newMonitor = StreamableReplicaSetMonitor::make(uri, getExecutor(), _getConnectionManager());
     }
     _monitors[setName] = newMonitor;
+    _numMonitorsCreated++;
     return newMonitor;
 }
 
@@ -285,6 +287,8 @@ void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
     // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook
     // potentially calling ShardRegistry::updateConfigServerConnectionString.
     auto setNames = getAllSetNames();
+
+    builder->appendNumber("numReplicaSetMonitorsCreated", _numMonitorsCreated);
 
     BSONObjBuilder setStats(
         builder->subobjStart(forFTDC ? "replicaSetPingTimesMillis" : "replicaSets"));

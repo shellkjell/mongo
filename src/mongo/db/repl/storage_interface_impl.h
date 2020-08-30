@@ -83,6 +83,10 @@ public:
                             const NamespaceString& nss,
                             const CollectionOptions& options) override;
 
+    Status createIndexesOnEmptyCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const std::vector<BSONObj>& secondaryIndexSpecs) override;
+
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
     Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override;
@@ -176,8 +180,6 @@ public:
     void initializeStorageControlsForReplication(ServiceContext* serviceCtx) const override;
 
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
-
-    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
 
     Timestamp getAllDurableTimestamp(ServiceContext* serviceCtx) const override;
 

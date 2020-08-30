@@ -9,7 +9,7 @@
  * updates increment the value of x. We test that the snapshot read only returns documents where _id
  * is between 0-99, and the value of x is always 1.
  *
- * @tags: [requires_fcv_46, requires_replication, does_not_support_causal_consistency,
+ * @tags: [requires_fcv_47, requires_replication, does_not_support_causal_consistency,
  * requires_majority_read_concern]
  */
 
@@ -25,23 +25,26 @@ var $config = (function() {
         },
 
         snapshotScan: function snapshotScan(db, collName) {
-            const readErrorCodes = [
-                ErrorCodes.ShutdownInProgress,
-            ];
             if (!this.cursorId || this.cursorId == 0) {
-                doSnapshotFindAtClusterTime(db, collName, this, readErrorCodes, {_id: 1}, (res) => {
-                    let expectedDocs =
-                        [...Array(this.batchSize).keys()].map((i) => ({_id: i, x: 1}));
-                    assert.eq(res.cursor.firstBatch, expectedDocs, () => tojson(res));
-                    this.numDocScanned = this.batchSize;
-                });
+                doSnapshotFindAtClusterTime(
+                    db, collName, this, [ErrorCodes.ShutdownInProgress], {_id: 1}, (res) => {
+                        let expectedDocs =
+                            [...Array(this.batchSize).keys()].map((i) => ({_id: i, x: 1}));
+                        assert.eq(res.cursor.firstBatch, expectedDocs, () => tojson(res));
+                        this.numDocScanned = this.batchSize;
+                    });
             } else {
-                doSnapshotGetMoreAtClusterTime(db, collName, this, readErrorCodes, (res) => {
-                    let expectedDocs = [...Array(this.batchSize).keys()].map(
-                        (i) => ({_id: i + this.numDocScanned, x: 1}));
-                    assert.eq(res.cursor.nextBatch, expectedDocs, () => tojson(res));
-                    this.numDocScanned = this.numDocScanned + this.batchSize;
-                });
+                doSnapshotGetMoreAtClusterTime(
+                    db,
+                    collName,
+                    this,
+                    [ErrorCodes.ShutdownInProgress, ErrorCodes.Interrupted],
+                    (res) => {
+                        let expectedDocs = [...Array(this.batchSize).keys()].map(
+                            (i) => ({_id: i + this.numDocScanned, x: 1}));
+                        assert.eq(res.cursor.nextBatch, expectedDocs, () => tojson(res));
+                        this.numDocScanned = this.numDocScanned + this.batchSize;
+                    });
             }
         },
 

@@ -106,11 +106,7 @@ std::pair<value::TypeTags, value::Value> convertFrom(bool view,
                 return {value::TypeTags::NumberDecimal, value::bitcastFrom(be)};
             }
 
-            uint64_t low = ConstDataView(be).read<LittleEndian<uint64_t>>();
-            uint64_t high = ConstDataView(be + sizeof(uint64_t)).read<LittleEndian<uint64_t>>();
-            auto dec = Decimal128{Decimal128::Value({low, high})};
-
-            return value::makeCopyDecimal(dec);
+            return value::makeCopyDecimal(value::readDecimal128FromMemory(ConstDataView{be}));
         }
         case BSONType::String: {
             if (view) {
@@ -132,6 +128,27 @@ std::pair<value::TypeTags, value::Value> convertFrom(bool view,
                 auto str = new char[len];
                 memcpy(str, be, len);
                 return {value::TypeTags::StringBig, value::bitcastFrom(str)};
+            }
+        }
+        case BSONType::BinData: {
+            if (view) {
+                return {value::TypeTags::bsonBinData, value::bitcastFrom(be)};
+            }
+
+            auto size = ConstDataView(be).read<LittleEndian<uint32_t>>();
+            auto subtype = static_cast<BinDataType>((be + sizeof(uint32_t))[0]);
+
+            if (subtype != BinDataType::ByteArrayDeprecated) {
+                auto metaSize = sizeof(uint32_t) + 1;
+                auto binData = new uint8_t[size + metaSize];
+                memcpy(binData, be, size + metaSize);
+                return {value::TypeTags::bsonBinData, value::bitcastFrom(binData)};
+            } else {
+                // The legacy byte array stores an extra int32 in byte[size].
+                auto metaSize = 2 * sizeof(uint32_t) + 1;
+                auto binData = new uint8_t[size + metaSize];
+                memcpy(binData, be, size + metaSize);
+                return {value::TypeTags::bsonBinData, value::bitcastFrom(binData)};
             }
         }
         case BSONType::Object: {
@@ -272,10 +289,21 @@ void convertToBsonObj(BSONArrayBuilder& builder, value::ArrayEnumerator arr) {
             case value::TypeTags::bsonObjectId:
                 builder.append(OID::from(value::bitcastTo<const char*>(val)));
                 break;
+            case value::TypeTags::bsonBinData: {
+                // BinData is also subject to the bson size limit, so the cast here is safe.
+                builder.append(BSONBinData{value::getBSONBinData(tag, val),
+                                           static_cast<int>(value::getBSONBinDataSize(tag, val)),
+                                           getBSONBinDataSubtype(tag, val)});
+                break;
+            }
             default:
                 MONGO_UNREACHABLE;
         }
     }
+}
+void convertToBsonObj(BSONArrayBuilder& builder, value::Array* arr) {
+    return convertToBsonObj(
+        builder, value::ArrayEnumerator{value::TypeTags::Array, value::bitcastFrom(arr)});
 }
 void convertToBsonObj(BSONObjBuilder& builder, value::Object* obj) {
     for (size_t idx = 0; idx < obj->size(); ++idx) {
@@ -346,6 +374,13 @@ void convertToBsonObj(BSONObjBuilder& builder, value::Object* obj) {
             case value::TypeTags::bsonObjectId:
                 builder.append(name, OID::from(value::bitcastTo<const char*>(val)));
                 break;
+            case value::TypeTags::bsonBinData: {
+                builder.appendBinData(name,
+                                      value::getBSONBinDataSize(tag, val),
+                                      value::getBSONBinDataSubtype(tag, val),
+                                      value::getBSONBinData(tag, val));
+                break;
+            }
             default:
                 MONGO_UNREACHABLE;
         }

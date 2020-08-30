@@ -41,6 +41,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/db_raii.h"
@@ -98,7 +99,7 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
                       "Plan executor error during findAndModify: {error}, stats: {stats}",
                       "Plan executor error during findAndModify",
                       "error"_attr = exception.toStatus(),
-                      "stats"_attr = redact(Explain::getWinningPlanStats(exec)));
+                      "stats"_attr = redact(exec->getStats()));
 
         exception.addContext("Plan executor error during findAndModify");
         throw;
@@ -212,7 +213,12 @@ void checkIfTransactionOnCappedColl(Collection* coll, bool inTransaction) {
 
 class CmdFindAndModify : public BasicCommand {
 public:
-    CmdFindAndModify() : BasicCommand("findAndModify", "findandmodify") {}
+    CmdFindAndModify()
+        : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::string help() const override {
         return "{ findAndModify: \"collection\", query: {processed:false}, update: {$set: "
@@ -322,6 +328,9 @@ public:
         uassertStatusOK(userAllowedWriteNS(nsString));
         auto const curOp = CurOp::get(opCtx);
         OpDebug* const opDebug = &curOp->debug();
+
+        // Collect metrics.
+        _updateMetrics.collectMetrics(cmdObj);
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj)) {
@@ -464,7 +473,7 @@ public:
 
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
         }
 
         auto docFound = advanceExecutor(opCtx, exec.get(), args.isRemove());
@@ -473,7 +482,7 @@ public:
         // multiple times.
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getSummaryStats(&summaryStats);
         if (collection) {
             CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
@@ -483,9 +492,7 @@ public:
         opDebug->additiveMetrics.ndeleted = DeleteStage::getNumDeleted(*exec);
 
         if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+            curOp->debug().execStats = exec->getStats();
         }
         recordStatsForTopCommand(opCtx);
 
@@ -545,7 +552,7 @@ public:
 
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
         }
 
         auto docFound = advanceExecutor(opCtx, exec.get(), args.isRemove());
@@ -554,7 +561,7 @@ public:
         // multiple times.
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getSummaryStats(&summaryStats);
         if (collection) {
             CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
@@ -562,9 +569,7 @@ public:
         opDebug->setPlanSummaryMetrics(summaryStats);
 
         if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+            curOp->debug().execStats = exec->getStats();
         }
         recordStatsForTopCommand(opCtx);
 
@@ -594,6 +599,9 @@ public:
         bob->append("singleBatch", true);
     }
 
+private:
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } cmdFindAndModify;
 
 }  // namespace

@@ -49,13 +49,13 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
@@ -445,9 +445,14 @@ repl::OpTime MigrationDestinationManager::cloneDocumentsFromDonor(
     repl::OpTime lastOpApplied;
 
     stdx::thread inserterThread{[&] {
-        Client::initKillableThread("chunkInserter", opCtx->getServiceContext());
+        Client::initThread("chunkInserter", opCtx->getServiceContext(), nullptr);
+        auto client = Client::getCurrent();
+        {
+            stdx::lock_guard lk(*client);
+            client->setSystemOperationKillableByStepdown(lk);
+        }
 
-        auto inserterOpCtx = Client::getCurrent()->makeOperationContext();
+        auto inserterOpCtx = client->makeOperationContext();
         auto consumerGuard = makeGuard([&] {
             batches.closeConsumerEnd();
             lastOpApplied = repl::ReplClientInfo::forClient(inserterOpCtx->getClient()).getLastOp();
@@ -798,8 +803,14 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
 }
 
 void MigrationDestinationManager::_migrateThread() {
-    Client::initKillableThread("migrateThread", getGlobalServiceContext());
-    auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
+    Client::initThread("migrateThread");
+    auto client = Client::getCurrent();
+    {
+        stdx::lock_guard lk(*client);
+        client->setSystemOperationKillableByStepdown(lk);
+    }
+
+    auto uniqueOpCtx = client->makeOperationContext();
     auto opCtx = uniqueOpCtx.get();
 
     if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
@@ -946,7 +957,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
     {
         stdx::lock_guard<Client> lk(*newClient.get());
-        newClient->setSystemOperationKillable(lk);
+        newClient->setSystemOperationKillableByStepdown(lk);
     }
 
     AlternativeClientRegion acr(newClient);

@@ -81,6 +81,11 @@ public:
 
     Status setTimestamp(Timestamp timestamp) override;
 
+    void setTimestampReadSource(ReadSource readSource,
+                                boost::optional<Timestamp> provided) override;
+
+    ReadSource getTimestampReadSource() const override;
+
     // Ephemeral for test specific function declarations below.
     StringStore* getHead() {
         forkIfNeeded();
@@ -108,10 +113,15 @@ private:
 
     void _abort();
 
+    void _setMergeNull();
+
     std::function<void()> _waitUntilDurableCallback;
     // Official master is kept by KVEngine
     KVEngine* _KVEngine;
-    StringStore _mergeBase;
+    // We need _mergeBase to be a shared_ptr to hold references in KVEngine::_availableHistory.
+    // _mergeBase will be initialized in forkIfNeeded().
+    std::shared_ptr<StringStore> _mergeBase;
+    // We need _workingCopy to be a unique copy, not a shared_ptr.
     StringStore _workingCopy;
 
     bool _forked = false;
@@ -119,6 +129,10 @@ private:
 
     Timestamp _prepareTimestamp = Timestamp::min();
     Timestamp _commitTimestamp = Timestamp::min();
+
+    // Specifies which external source to use when setting read timestamps on transactions.
+    ReadSource _timestampReadSource = ReadSource::kUnset;
+    boost::optional<Timestamp> _readAtTimestamp = boost::none;
 };
 
 }  // namespace ephemeral_for_test

@@ -58,11 +58,15 @@
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/storage_util.h"
+#include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+#include <boost/filesystem/operations.hpp>
 #include <boost/iterator/transform_iterator.hpp>
 
 namespace mongo {
@@ -75,6 +79,11 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeCompletingAbort);
 MONGO_FAIL_POINT_DEFINE(failIndexBuildOnCommit);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeAbortCleanUp);
 MONGO_FAIL_POINT_DEFINE(hangIndexBuildOnStepUp);
+MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpResumableIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeCommit);
+MONGO_FAIL_POINT_DEFINE(hangBeforeBuildingIndex);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildBeforeWaitingUntilMajorityOpTime);
+MONGO_FAIL_POINT_DEFINE(failSetUpResumeIndexBuild);
 
 namespace {
 
@@ -360,6 +369,82 @@ repl::OpTime getLatestOplogOpTime(OperationContext* opCtx) {
     return optime.getValue();
 }
 
+/**
+ * Returns true if the index build is resumable.
+ */
+bool isIndexBuildResumable(OperationContext* opCtx,
+                           const ReplIndexBuildState& replState,
+                           const IndexBuildsCoordinator::IndexBuildOptions& indexBuildOptions) {
+
+    if (replState.protocol != IndexBuildProtocol::kTwoPhase) {
+        return false;
+    }
+
+    if (indexBuildOptions.applicationMode != IndexBuildsCoordinator::ApplicationMode::kNormal) {
+        return false;
+    }
+
+    // This check may be unnecessary due to current criteria for resumable index build support in
+    // storage engine.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        return false;
+    }
+
+    // The last optime could be null if the node is in initial sync while building the index.
+    // This check may be redundant with the 'applicationMode' check and the replication requirement
+    // for two phase index builds.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeNone) {
+        return false;
+    }
+
+    // When we are applying a startIndexBuild oplog entry during the oplog application phase of
+    // startup recovery, the last optime here derived from the local oplog may not be a valid
+    // optime to wait on for the majority commit point since the rest of the replica set may
+    // be on a different branch of history.
+    // TODO(SERVER-48419): Examine impact on rollback.
+    if (inReplicationRecovery(opCtx->getServiceContext())) {
+        LOGV2(5039100,
+              "Index build: in replication recovery. Not waiting for last optime before "
+              "interceptors to be majority committed",
+              "buildUUID"_attr = replState.buildUUID);
+        return false;
+    }
+
+    // TODO(SERVER-50479): Remove this check when resumable index builds work with ESE in GCM mode.
+    if (EncryptionHooks::get(opCtx->getServiceContext())->enabled()) {
+        return false;
+    }
+
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsResumableIndexBuilds()) {
+        return false;
+    }
+
+    // IndexBuildsOptions::commitQuorum will be set if we are primary. Otherwise, we have to check
+    // the config.system.indexBuilds collection.
+    if (indexBuildOptions.commitQuorum) {
+        if (indexBuildOptions.commitQuorum->numNodes == CommitQuorumOptions::kDisabled) {
+            return false;
+        }
+    } else {
+        auto swCommitQuorum = indexbuildentryhelpers::getCommitQuorum(opCtx, replState.buildUUID);
+        if (!swCommitQuorum.isOK()) {
+            LOGV2(5044600,
+                  "Index build: cannot read commit quorum from config db. "
+                  "Index build will not be resumable.",
+                  "buildUUID"_attr = replState.buildUUID,
+                  "error"_attr = swCommitQuorum.getStatus());
+            return false;
+        }
+        auto commitQuorum = swCommitQuorum.getValue();
+        if (commitQuorum.numNodes == CommitQuorumOptions::kDisabled) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 }  // namespace
 
 const auto getIndexBuildsCoord =
@@ -500,11 +585,15 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
                     return s;
                 }
             } else {
-                Status status = DurableCatalog::get(opCtx)->removeIndex(
-                    opCtx, collection->getCatalogId(), indexNames[i]);
-                if (!status.isOK()) {
-                    return status;
-                }
+                // There are no concurrent users of the index during startup recovery, so it is OK
+                // to pass in a nullptr for the index 'ident', promising that the index is not in
+                // use.
+                catalog::removeIndex(opCtx,
+                                     indexNames[i],
+                                     collection->getCatalogId(),
+                                     collection->uuid(),
+                                     collection->ns(),
+                                     nullptr /* ident */);
             }
         }
 
@@ -540,6 +629,93 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
     }
 
     return Status::OK();
+}
+
+Status IndexBuildsCoordinator::_setUpResumeIndexBuild(OperationContext* opCtx,
+                                                      std::string dbName,
+                                                      CollectionUUID collectionUUID,
+                                                      const std::vector<BSONObj>& specs,
+                                                      const UUID& buildUUID,
+                                                      const ResumeIndexInfo& resumeInfo) {
+    NamespaceStringOrUUID nssOrUuid{dbName, collectionUUID};
+
+    if (MONGO_unlikely(failSetUpResumeIndexBuild.shouldFail())) {
+        return {ErrorCodes::FailPointEnabled, "failSetUpResumeIndexBuild fail point is enabled"};
+    }
+
+    Lock::DBLock dbLock(opCtx, dbName, MODE_IX);
+    Lock::CollectionLock collLock(opCtx, nssOrUuid, MODE_X);
+
+    auto& collectionCatalog = CollectionCatalog::get(opCtx->getServiceContext());
+    auto collection =
+        collectionCatalog.lookupCollectionByUUID(opCtx, resumeInfo.getCollectionUUID());
+    invariant(collection);
+    auto durableCatalog = DurableCatalog::get(opCtx);
+
+    for (auto spec : specs) {
+        std::string indexName = spec.getStringField(IndexDescriptor::kIndexNameFieldName);
+        if (indexName.empty()) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream()
+                              << "Cannot create an index for a spec '" << spec
+                              << "' without a non-empty string value for the 'name' field");
+        }
+
+        // Check that the information in the durable catalog matches the resume info.
+        uassert(4841702,
+                "Index not found in durable catalog while attempting to resume index build",
+                durableCatalog->isIndexPresent(opCtx, collection->getCatalogId(), indexName));
+
+        const auto durableBuildUUID =
+            durableCatalog->getIndexBuildUUID(opCtx, collection->getCatalogId(), indexName);
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << "Cannot resume index build with a buildUUID: " << buildUUID
+                              << " that did not match the buildUUID in the durable catalog: "
+                              << durableBuildUUID,
+                durableBuildUUID == buildUUID);
+
+        auto indexIdent =
+            durableCatalog->getIndexIdent(opCtx, collection->getCatalogId(), indexName);
+        uassert(
+            4841703,
+            str::stream() << "No index ident found on disk that matches the index build to resume: "
+                          << indexName,
+            indexIdent.size() > 0);
+
+        uassertStatusOK(durableCatalog->checkMetaDataForIndex(
+            opCtx, collection->getCatalogId(), indexName, spec));
+    }
+
+    if (!collection->isInitialized()) {
+        collection->init(opCtx);
+    }
+
+    auto protocol = IndexBuildProtocol::kTwoPhase;
+    auto replIndexBuildState = std::make_shared<ReplIndexBuildState>(
+        buildUUID, collection->uuid(), dbName, specs, protocol);
+
+    Status status = [&]() {
+        stdx::unique_lock<Latch> lk(_mutex);
+        return _registerIndexBuild(lk, replIndexBuildState);
+    }();
+    if (!status.isOK()) {
+        return status;
+    }
+
+    IndexBuildsManager::SetupOptions options;
+    options.protocol = protocol;
+    status = _indexBuildsManager.setUpIndexBuild(
+        opCtx, collection, specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options, resumeInfo);
+    if (!status.isOK()) {
+        LOGV2(4841705,
+              "Failed to resume index build",
+              "buildUUID"_attr = buildUUID,
+              logAttrs(collection->ns()),
+              "collectionUUID"_attr = collectionUUID,
+              "error"_attr = status);
+    }
+
+    return status;
 }
 
 std::string IndexBuildsCoordinator::_indexBuildActionToString(IndexBuildAction action) {
@@ -642,8 +818,15 @@ void IndexBuildsCoordinator::abortDatabaseIndexBuilds(OperationContext* opCtx,
         return _filterIndexBuilds_inlock(lk, indexBuildFilter);
     }();
     for (auto replState : builds) {
-        abortIndexBuildByBuildUUID(
-            opCtx, replState->buildUUID, IndexBuildAction::kPrimaryAbort, reason);
+        if (!abortIndexBuildByBuildUUID(
+                opCtx, replState->buildUUID, IndexBuildAction::kPrimaryAbort, reason)) {
+            // The index build may already be in the midst of tearing down.
+            LOGV2(5010502,
+                  "Index build: failed to abort index build for database drop",
+                  "buildUUID"_attr = replState->buildUUID,
+                  "database"_attr = db,
+                  "collectionUUID"_attr = replState->collectionUUID);
+        }
     }
 }
 
@@ -657,8 +840,15 @@ void IndexBuildsCoordinator::abortAllIndexBuildsForInitialSync(OperationContext*
         return _filterIndexBuilds_inlock(lk, indexBuildFilter);
     }();
     for (auto replState : builds) {
-        abortIndexBuildByBuildUUID(
-            opCtx, replState->buildUUID, IndexBuildAction::kInitialSyncAbort, reason);
+        if (!abortIndexBuildByBuildUUID(
+                opCtx, replState->buildUUID, IndexBuildAction::kInitialSyncAbort, reason)) {
+            // The index build may already be in the midst of tearing down.
+            LOGV2(5010503,
+                  "Index build: failed to abort index build for initial sync",
+                  "buildUUID"_attr = replState->buildUUID,
+                  "database"_attr = replState->dbName,
+                  "collectionUUID"_attr = replState->collectionUUID);
+        }
     }
 }
 
@@ -837,9 +1027,15 @@ void IndexBuildsCoordinator::applyAbortIndexBuild(OperationContext* opCtx,
 
     std::string abortReason(str::stream()
                             << "abortIndexBuild oplog entry encountered: " << *oplogEntry.cause);
-    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
-    indexBuildsCoord->abortIndexBuildByBuildUUID(
-        opCtx, buildUUID, IndexBuildAction::kOplogAbort, abortReason);
+    if (!abortIndexBuildByBuildUUID(opCtx, buildUUID, IndexBuildAction::kOplogAbort, abortReason)) {
+        // The index build may already be in the midst of tearing down.
+        LOGV2(5010504,
+              "Index build: failed to abort index build while applying abortIndexBuild operation",
+              "buildUUID"_attr = buildUUID,
+              "namespace"_attr = nss,
+              "collectionUUID"_attr = collUUID,
+              "cause"_attr = *oplogEntry.cause);
+    }
 }
 
 boost::optional<UUID> IndexBuildsCoordinator::abortIndexBuildByIndexNames(
@@ -1193,8 +1389,9 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
         case IndexBuildAction::kRollbackAbort: {
             invariant(replState->protocol == IndexBuildProtocol::kTwoPhase);
             invariant(replCoord->getMemberState().rollback());
+            auto isResumable = !replState->lastOpTimeBeforeInterceptors.isNull();
             _indexBuildsManager.abortIndexBuildWithoutCleanupForRollback(
-                opCtx, coll, replState->buildUUID, reason.reason());
+                opCtx, coll, replState->buildUUID, isResumable);
             break;
         }
         case IndexBuildAction::kNoAction:
@@ -1227,8 +1424,9 @@ void IndexBuildsCoordinator::_completeAbortForShutdown(
     std::shared_ptr<ReplIndexBuildState> replState,
     Collection* collection) {
     // Leave it as-if kill -9 happened. Startup recovery will restart the index build.
+    auto isResumable = !replState->lastOpTimeBeforeInterceptors.isNull();
     _indexBuildsManager.abortIndexBuildWithoutCleanupForShutdown(
-        opCtx, collection, replState->buildUUID);
+        opCtx, collection, replState->buildUUID, isResumable);
 
     {
         // Promise should be set at least once before it's getting destroyed.
@@ -1298,7 +1496,22 @@ IndexBuilds IndexBuildsCoordinator::stopIndexBuildsForRollback(OperationContext*
                   "buildUUID"_attr = replState->buildUUID);
             return;
         }
+
+        // This will unblock the index build and allow it to complete without cleaning up.
+        // Subsequently, the rollback algorithm can decide how to undo the index build depending on
+        // the state of the oplog. Signals the kRollbackAbort and then waits for the thread to join.
         const std::string reason = "rollback";
+        if (!abortIndexBuildByBuildUUID(
+                opCtx, replState->buildUUID, IndexBuildAction::kRollbackAbort, reason)) {
+            // The index build may already be in the midst of tearing down.
+            // Leave this index build out of 'buildsStopped'.
+            LOGV2(5010505,
+                  "Index build: failed to abort index build before rollback",
+                  "buildUUID"_attr = replState->buildUUID,
+                  "database"_attr = replState->dbName,
+                  "collectionUUID"_attr = replState->collectionUUID);
+            return;
+        }
 
         IndexBuildDetails aborted{replState->collectionUUID};
         // Record the index builds aborted due to rollback. This allows any rollback algorithm
@@ -1308,12 +1521,6 @@ IndexBuilds IndexBuildsCoordinator::stopIndexBuildsForRollback(OperationContext*
             aborted.indexSpecs.emplace_back(spec.getOwned());
         }
         buildsStopped.insert({replState->buildUUID, aborted});
-
-        // This will unblock the index build and allow it to complete without cleaning up.
-        // Subsequently, the rollback algorithm can decide how to undo the index build depending on
-        // the state of the oplog. Signals the kRollbackAbort and then waits for the thread to join.
-        abortIndexBuildByBuildUUID(
-            opCtx, replState->buildUUID, IndexBuildAction::kRollbackAbort, reason);
     };
     forEachIndexBuild(
         indexBuilds, "IndexBuildsCoordinator::stopIndexBuildsForRollback"_sd, onIndexBuild);
@@ -1321,16 +1528,81 @@ IndexBuilds IndexBuildsCoordinator::stopIndexBuildsForRollback(OperationContext*
     return buildsStopped;
 }
 
-void IndexBuildsCoordinator::restartIndexBuildsForRecovery(OperationContext* opCtx,
-                                                           const IndexBuilds& buildsToRestart) {
+void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
+    OperationContext* opCtx,
+    const IndexBuilds& buildsToRestart,
+    const std::vector<ResumeIndexInfo>& buildsToResume) {
+
+    stdx::unordered_set<UUID, UUID::Hash> successfullyResumed;
+
+    for (const auto& resumeInfo : buildsToResume) {
+        auto buildUUID = resumeInfo.getBuildUUID();
+        auto collUUID = resumeInfo.getCollectionUUID();
+
+        boost::optional<NamespaceString> nss =
+            CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, resumeInfo.getCollectionUUID());
+        invariant(nss);
+
+        std::vector<BSONObj> indexSpecs;
+        indexSpecs.reserve(resumeInfo.getIndexes().size());
+
+        for (const auto& index : resumeInfo.getIndexes()) {
+            indexSpecs.push_back(index.getSpec());
+        }
+
+        LOGV2(4841700,
+              "Index build: resuming",
+              logAttrs(nss.get()),
+              "collectionUUID"_attr = collUUID,
+              "buildUUID"_attr = buildUUID,
+              "specs"_attr = indexSpecs,
+              "phase"_attr = IndexBuildPhase_serializer(resumeInfo.getPhase()));
+
+        try {
+            // This spawns a new thread and returns immediately. These index builds will resume and
+            // wait for a commit or abort to be replicated.
+            MONGO_COMPILER_VARIABLE_UNUSED auto fut = uassertStatusOK(resumeIndexBuild(
+                opCtx, nss->db().toString(), collUUID, indexSpecs, buildUUID, resumeInfo));
+            successfullyResumed.insert(buildUUID);
+        } catch (const DBException& e) {
+            LOGV2(4841701,
+                  "Failed to resume index build, restarting instead",
+                  "buildUUID"_attr = buildUUID,
+                  "error"_attr = e);
+
+            // Clean up the persisted Sorter data since resuming failed.
+            for (const auto& index : resumeInfo.getIndexes()) {
+                LOGV2(5043100,
+                      "Removing resumable index build temp file",
+                      "file"_attr = index.getFileName(),
+                      "buildUUID"_attr = buildUUID);
+
+                boost::system::error_code ec;
+                boost::filesystem::remove(index.getFileName()->toString(), ec);
+
+                if (ec) {
+                    LOGV2(5043101,
+                          "Failed to remove resumable index build temp file",
+                          "file"_attr = index.getFileName(),
+                          "error"_attr = ec.message());
+                }
+            }
+        }
+    }
+
     for (auto& [buildUUID, build] : buildsToRestart) {
+        // Don't restart an index build that was already resumed.
+        if (successfullyResumed.contains(buildUUID)) {
+            continue;
+        }
+
         boost::optional<NamespaceString> nss =
             CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, build.collUUID);
         invariant(nss);
 
         LOGV2(20660,
-              "Restarting index build",
-              "collection"_attr = nss,
+              "Index build: restarting",
+              logAttrs(nss.get()),
               "collectionUUID"_attr = build.collUUID,
               "buildUUID"_attr = buildUUID);
         IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
@@ -1885,9 +2157,7 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
         throw;
     }
 
-    if (replState->protocol == IndexBuildProtocol::kTwoPhase &&
-        indexBuildOptions.applicationMode == ApplicationMode::kNormal &&
-        opCtx->getServiceContext()->getStorageEngine()->supportsResumableIndexBuilds()) {
+    if (isIndexBuildResumable(opCtx, *replState, indexBuildOptions)) {
         // We should only set this value if this is a hybrid index build.
         invariant(_indexBuildsManager.isBackgroundBuilding(replState->buildUUID));
 
@@ -1942,9 +2212,11 @@ Status IndexBuildsCoordinator::_setUpIndexBuild(OperationContext* opCtx,
     return Status::OK();
 }
 
-void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
-                                            const UUID& buildUUID,
-                                            const IndexBuildOptions& indexBuildOptions) noexcept {
+void IndexBuildsCoordinator::_runIndexBuild(
+    OperationContext* opCtx,
+    const UUID& buildUUID,
+    const IndexBuildOptions& indexBuildOptions,
+    const boost::optional<ResumeIndexInfo>& resumeInfo) noexcept {
     {
         stdx::unique_lock<Latch> lk(_mutex);
         while (_sleepForTest) {
@@ -1985,7 +2257,7 @@ void IndexBuildsCoordinator::_runIndexBuild(OperationContext* opCtx,
 
     auto status = [&]() {
         try {
-            _runIndexBuildInner(opCtx, replState, indexBuildOptions);
+            _runIndexBuildInner(opCtx, replState, indexBuildOptions, resumeInfo);
         } catch (const DBException& ex) {
             return ex.toStatus();
         }
@@ -2087,9 +2359,11 @@ void IndexBuildsCoordinator::_cleanUpTwoPhaseAfterFailure(
         });
 }
 
-void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
-                                                 std::shared_ptr<ReplIndexBuildState> replState,
-                                                 const IndexBuildOptions& indexBuildOptions) {
+void IndexBuildsCoordinator::_runIndexBuildInner(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    const IndexBuildOptions& indexBuildOptions,
+    const boost::optional<ResumeIndexInfo>& resumeInfo) {
     // This Status stays unchanged unless we catch an exception in the following try-catch block.
     auto status = Status::OK();
     try {
@@ -2097,7 +2371,12 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
             hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
         }
 
-        _buildIndex(opCtx, replState, indexBuildOptions);
+        if (resumeInfo) {
+            _resumeIndexBuildFromPhase(opCtx, replState, indexBuildOptions, resumeInfo.get());
+        } else {
+            _buildIndex(opCtx, replState, indexBuildOptions);
+        }
+
     } catch (const DBException& ex) {
         status = ex.toStatus();
     }
@@ -2155,25 +2434,94 @@ void IndexBuildsCoordinator::_runIndexBuildInner(OperationContext* opCtx,
     uassertStatusOK(status);
 }
 
+void IndexBuildsCoordinator::_resumeIndexBuildFromPhase(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    const IndexBuildOptions& indexBuildOptions,
+    const ResumeIndexInfo& resumeInfo) {
+    if (MONGO_unlikely(hangAfterSettingUpResumableIndexBuild.shouldFail())) {
+        LOGV2(4841704,
+              "Hanging index build due to failpoint 'hangAfterSettingUpResumableIndexBuild'");
+        hangAfterSettingUpResumableIndexBuild.pauseWhileSet();
+    }
+
+    if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kInitialized ||
+        resumeInfo.getPhase() == IndexBuildPhaseEnum::kCollectionScan) {
+        _scanCollectionAndInsertSortedKeysIntoIndex(
+            opCtx,
+            replState,
+            resumeInfo.getCollectionScanPosition()
+                ? boost::make_optional<RecordId>(RecordId(*resumeInfo.getCollectionScanPosition()))
+                : boost::none);
+    } else if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kBulkLoad) {
+        _insertSortedKeysIntoIndexForResume(opCtx, replState);
+    }
+
+    _insertKeysFromSideTablesWithoutBlockingWrites(opCtx, replState);
+    _signalPrimaryForCommitReadiness(opCtx, replState);
+    _insertKeysFromSideTablesBlockingWrites(opCtx, replState, indexBuildOptions);
+    _waitForNextIndexBuildActionAndCommit(opCtx, replState, indexBuildOptions);
+}
+
 void IndexBuildsCoordinator::_awaitLastOpTimeBeforeInterceptorsMajorityCommitted(
     OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
     // The last optime could be null if the node is in initial sync while building the index.
-    if (!serverGlobalParams.enableMajorityReadConcern ||
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeNone ||
-        replState->lastOpTimeBeforeInterceptors.isNull()) {
+    if (replState->lastOpTimeBeforeInterceptors.isNull()) {
         return;
+    }
+
+    auto timeoutMillis = gResumableIndexBuildMajorityOpTimeTimeoutMillis;
+    if (timeoutMillis == 0) {
+        // Disable resumable index build.
+        replState->lastOpTimeBeforeInterceptors = {};
+        return;
+    }
+
+    Milliseconds timeout;
+    Date_t deadline;
+    if (timeoutMillis > 0) {
+        timeout = Milliseconds(timeoutMillis);
+        deadline = opCtx->getServiceContext()->getFastClockSource()->now() + timeout;
+    } else {
+        // Wait indefinitely for majority commit point.
+        // Setting 'deadline' to Date_t::max() achieves the same effect as boost::none in
+        // ReplicationCoordinatorImpl::waitUntilMajorityOpTime(). Additionally, providing a
+        // 'deadline' of Date_t::max() is given special treatment in
+        // OperationContext::waitForConditionOrInterruptNoAssertUntil().
+        timeout = Milliseconds::max();
+        deadline = Date_t::max();
     }
 
     LOGV2(4847600,
           "Index build: waiting for last optime before interceptors to be majority committed",
           "buildUUID"_attr = replState->buildUUID,
+          "deadline"_attr = deadline,
+          "timeout"_attr = timeout,
           "lastOpTime"_attr = replState->lastOpTimeBeforeInterceptors);
 
-    auto status =
-        replCoord->waitUntilMajorityOpTime(opCtx, replState->lastOpTimeBeforeInterceptors);
-    uassertStatusOK(status);
+    if (MONGO_unlikely(hangIndexBuildBeforeWaitingUntilMajorityOpTime.shouldFail())) {
+        LOGV2(4940901,
+              "Hanging index build before waiting for the last optime before interceptors to be "
+              "majority committed due to hangIndexBuildBeforeWaitingUntilMajorityOpTime failpoint");
+        hangIndexBuildBeforeWaitingUntilMajorityOpTime.pauseWhileSet(opCtx);
+    }
+
+    auto status = replCoord->waitUntilMajorityOpTime(
+        opCtx, replState->lastOpTimeBeforeInterceptors, deadline);
+    if (!status.isOK()) {
+        replState->lastOpTimeBeforeInterceptors = {};
+        LOGV2(5053900,
+              "Index build: timed out waiting for the last optime before interceptors to be "
+              "majority committed. Continuing as a non-resumable index build.",
+              "buildUUID"_attr = replState->buildUUID,
+              "deadline"_attr = deadline,
+              "timeout"_attr = timeout,
+              "lastOpTime"_attr = replState->lastOpTimeBeforeInterceptors,
+              "waitStatus"_attr = status);
+        return;
+    }
 
     // Since we waited for all the writes before the interceptors were established to be majority
     // committed, if we read at the majority commit point for the collection scan, then none of the
@@ -2184,12 +2532,17 @@ void IndexBuildsCoordinator::_awaitLastOpTimeBeforeInterceptorsMajorityCommitted
 void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
                                          std::shared_ptr<ReplIndexBuildState> replState,
                                          const IndexBuildOptions& indexBuildOptions) {
+    if (MONGO_unlikely(hangBeforeBuildingIndex.shouldFail())) {
+        LOGV2(4940900, "Hanging before building index due to hangBeforeBuildingIndex failpoint");
+        hangBeforeBuildingIndex.pauseWhileSet();
+    }
+
     // Read without a timestamp. When we commit, we block writes which guarantees all writes are
     // visible.
     opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
     // The collection scan might read with a kMajorityCommitted read source, but will restore
     // kNoTimestamp afterwards.
-    _scanCollectionAndInsertKeysIntoSorter(opCtx, replState);
+    _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState);
     _insertKeysFromSideTablesWithoutBlockingWrites(opCtx, replState);
     _signalPrimaryForCommitReadiness(opCtx, replState);
     _insertKeysFromSideTablesBlockingWrites(opCtx, replState, indexBuildOptions);
@@ -2200,8 +2553,10 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
  * First phase is doing a collection scan and inserting keys into sorter.
  * Second phase is extracting the sorted keys and writing them into the new index table.
  */
-void IndexBuildsCoordinator::_scanCollectionAndInsertKeysIntoSorter(
-    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+void IndexBuildsCoordinator::_scanCollectionAndInsertSortedKeysIntoIndex(
+    OperationContext* opCtx,
+    std::shared_ptr<ReplIndexBuildState> replState,
+    boost::optional<RecordId> resumeAfterRecordId) {
     // Collection scan and insert into index.
     {
 
@@ -2218,34 +2573,58 @@ void IndexBuildsCoordinator::_scanCollectionAndInsertKeysIntoSorter(
         const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
         Lock::CollectionLock collLock(opCtx, dbAndUUID, MODE_IX);
 
-        // Rebuilding system indexes during startup using the IndexBuildsCoordinator is done by all
-        // storage engines if they're missing.
-        invariant(_indexBuildsManager.isBackgroundBuilding(replState->buildUUID));
-
-        auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, replState->collectionUUID);
-        invariant(nss);
-
-        // Set up the thread's currentOp information to display createIndexes cmd information.
-        updateCurOpOpDescription(opCtx, *nss, replState->indexSpecs);
-
-        // Index builds can safely ignore prepare conflicts and perform writes. On secondaries,
-        // prepare operations wait for index builds to complete.
-        opCtx->recoveryUnit()->setPrepareConflictBehavior(
-            PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
+        _setUpForScanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState);
 
         // The collection object should always exist while an index build is registered.
         auto collection =
             CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, replState->collectionUUID);
         invariant(collection);
 
-        uassertStatusOK(
-            _indexBuildsManager.startBuildingIndex(opCtx, collection, replState->buildUUID));
+        uassertStatusOK(_indexBuildsManager.startBuildingIndex(
+            opCtx, collection, replState->buildUUID, resumeAfterRecordId));
     }
 
     if (MONGO_unlikely(hangAfterIndexBuildDumpsInsertsFromBulk.shouldFail())) {
         LOGV2(20665, "Hanging after dumping inserts from bulk builder");
         hangAfterIndexBuildDumpsInsertsFromBulk.pauseWhileSet();
     }
+}
+
+void IndexBuildsCoordinator::_insertSortedKeysIntoIndexForResume(
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+    {
+        Lock::DBLock autoDb(opCtx, replState->dbName, MODE_IX);
+        const NamespaceStringOrUUID dbAndUUID(replState->dbName, replState->collectionUUID);
+        Lock::CollectionLock collLock(opCtx, dbAndUUID, MODE_IX);
+
+        _setUpForScanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState);
+
+        uassertStatusOK(
+            _indexBuildsManager.resumeBuildingIndexFromBulkLoadPhase(opCtx, replState->buildUUID));
+    }
+
+    if (MONGO_unlikely(hangAfterIndexBuildDumpsInsertsFromBulk.shouldFail())) {
+        LOGV2(4940800, "Hanging after dumping inserts from bulk builder");
+        hangAfterIndexBuildDumpsInsertsFromBulk.pauseWhileSet();
+    }
+}
+
+void IndexBuildsCoordinator::_setUpForScanCollectionAndInsertSortedKeysIntoIndex(
+    OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+    // Rebuilding system indexes during startup using the IndexBuildsCoordinator is done by all
+    // storage engines if they're missing.
+    invariant(_indexBuildsManager.isBackgroundBuilding(replState->buildUUID));
+
+    auto nss = CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, replState->collectionUUID);
+    invariant(nss);
+
+    // Set up the thread's currentOp information to display createIndexes cmd information.
+    updateCurOpOpDescription(opCtx, *nss, replState->indexSpecs);
+
+    // Index builds can safely ignore prepare conflicts and perform writes. On secondaries,
+    // prepare operations wait for index builds to complete.
+    opCtx->recoveryUnit()->setPrepareConflictBehavior(
+        PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 }
 
 /*
@@ -2268,7 +2647,7 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesWithoutBlockingWrites(
 
     if (MONGO_unlikely(hangAfterIndexBuildFirstDrain.shouldFail())) {
         LOGV2(20666, "Hanging after index build first drain");
-        hangAfterIndexBuildFirstDrain.pauseWhileSet();
+        hangAfterIndexBuildFirstDrain.pauseWhileSet(opCtx);
     }
 }
 void IndexBuildsCoordinator::_insertKeysFromSideTablesBlockingWrites(
@@ -2309,6 +2688,11 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     const IndexBuildOptions& indexBuildOptions,
     const Timestamp& commitIndexBuildTimestamp) {
 
+    if (MONGO_unlikely(hangIndexBuildBeforeCommit.shouldFail())) {
+        LOGV2(4841706, "Hanging before committing index build");
+        hangIndexBuildBeforeCommit.pauseWhileSet();
+    }
+
     Lock::DBLock autoDb(opCtx, replState->dbName, MODE_IX);
 
     // Unlock RSTL to avoid deadlocks with prepare conflicts and state transitions caused by waiting
@@ -2343,7 +2727,8 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     // new signal from a new primary because we cannot commit. Note that two-phase index builds can
     // retry because a new signal should be received. Single-phase builds will be unable to commit
     // and will self-abort.
-    bool isMaster = replCoord->canAcceptWritesFor(opCtx, dbAndUUID);
+    bool isMaster = replCoord->canAcceptWritesFor(opCtx, dbAndUUID) &&
+        !replCoord->getSettings().shouldRecoverFromOplogAsStandalone();
     if (!isMaster && IndexBuildAction::kCommitQuorumSatisfied == action) {
         return CommitResult::kNoLongerPrimary;
     }
@@ -2510,7 +2895,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
 
         std::tie(numRecords, dataSize) =
             uassertStatusOK(_indexBuildsManager.startBuildingIndexForRecovery(
-                opCtx, collection->ns(), buildUUID, repair));
+                opCtx, collection, buildUUID, repair));
 
         // Since we are holding an exclusive collection lock to stop new writes, do not yield locks
         // while draining.

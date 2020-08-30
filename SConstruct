@@ -13,6 +13,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+from glob import glob
 
 from pkg_resources import parse_version
 
@@ -111,6 +112,13 @@ add_option('ninja',
     const='stable',
     type='choice',
     help='Enable the build.ninja generator tool stable or canary version',
+)
+
+add_option('build-tools',
+    choices=['stable', 'next'],
+    default='stable',
+    type='choice',
+    help='Enable experimental build tools',
 )
 
 add_option('legacy-tarball',
@@ -264,11 +272,6 @@ add_option('sanitize',
 add_option('sanitize-coverage',
     help='enable selected coverage sanitizers',
     metavar='cov1,cov2,...covN',
-)
-
-add_option('llvm-symbolizer',
-    default='llvm-symbolizer',
-    help='name of (or path to) the LLVM symbolizer',
 )
 
 add_option('allocator',
@@ -525,6 +528,15 @@ add_option('enable-usdt-probes',
     const='on',
 )
 
+add_option('libdeps-linting',
+    choices=['on', 'off', 'print'],
+    const='on',
+    default='on',
+    help='Enable linting of libdeps. Default is on, optionally \'print\' will not stop the build.',
+    nargs='?',
+    type='choice',
+)
+
 try:
     with open("version.json", "r") as version_fp:
         version_data = json.load(version_fp)
@@ -621,6 +633,10 @@ def variable_distsrc_converter(val):
         return val + "/"
     return val
 
+def fatal_error(env, msg, *args):
+    print(msg.format(*args))
+    Exit(1)
+
 # Apply the default variables files, and walk the provided
 # arguments. Interpret any falsy argument (like the empty string) as
 # resetting any prior state. This makes the argument
@@ -634,10 +650,9 @@ for variables_file in variables_files_args:
     else:
         variables_files = []
 for vf in variables_files:
-    if os.path.isfile(vf):
-        print("Using variable customization file {}".format(vf))
-    else:
-        print("IGNORING missing variable customization file {}".format(vf))
+    if not os.path.isfile(vf):
+        fatal_error(None, f"Specified variables file '{vf}' does not exist")
+    print(f"Using variable customization file {vf}")
 
 env_vars = Variables(
     files=variables_files,
@@ -771,6 +786,9 @@ env_vars.Add('LINKFLAGS',
     help='Sets flags for the linker',
     converter=variable_shlex_converter)
 
+env_vars.Add('LLVM_SYMBOLIZER',
+    help='Name of or path to the LLVM symbolizer')
+
 env_vars.Add('MAXLINELENGTH',
     help='Maximum line length before using temp files',
     # This is very small, but appears to be the least upper bound
@@ -873,7 +891,7 @@ env_vars.Add('PKGDIR',
 
 env_vars.Add('PREFIX',
     help='Final installation location of files, will be made into a sub dir of $DESTDIR',
-    default='')
+    default='.')
 
 # Exposed to be able to cross compile Android/*nix from Windows without ending up with the .exe suffix.
 env_vars.Add('PROGSUFFIX',
@@ -1062,6 +1080,14 @@ envDict = dict(BUILD_ROOT=buildDir,
                LIBDEPS_TAG_EXPANSIONS=[],
                )
 
+
+# By default, we will get the normal SCons tool search. But if the
+# user has opted into the next gen tools, add our experimental tool
+# directory into the default toolpath, ahead of whatever is already in
+# there so it overrides it.
+if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+    SCons.Tool.DefaultToolpath.insert(0, os.path.abspath('site_scons/site_tools/next'))
+
 env = Environment(variables=env_vars, **envDict)
 
 # Only print the spinner if stdout is a tty
@@ -1089,10 +1115,6 @@ for var in ['CC', 'CXX']:
 
 env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
-
-def fatal_error(env, msg, *args):
-    print(msg.format(*args))
-    Exit(1)
 
 def conf_error(env, msg, *args):
     print(msg.format(*args))
@@ -1643,7 +1665,10 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # command but instead runs a function.
     env["BUILDERS"]["StaticLibrary"].action = SCons.Action.Action(write_uuid_to_file, "Generating placeholder library $TARGET")
 
-libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")))
+libdeps.setup_environment(
+    env,
+    emitting_shared=(link_model.startswith("dynamic")),
+    linting=get_option('libdeps-linting'))
 
 # Both the abidw tool and the thin archive tool must be loaded after
 # libdeps, so that the scanners they inject can see the library
@@ -1665,21 +1690,69 @@ if env['_LIBDEPS'] == '$_LIBDEPS_LIBS':
         env.Tool('thin_archive')
 
 if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
-    # NOTE: The leading and trailing spaces here are important. Do not remove them.
-    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,--whole-archive '
-    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -Wl,--no-whole-archive'
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,--whole-archive'
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = '-Wl,--no-whole-archive'
+    env['LINK_AS_NEEDED_LIB_START'] = '-Wl,--as-needed'
+    env['LINK_AS_NEEDED_LIB_END'] = '-Wl,--no-as-needed'
 elif env.TargetOSIs('darwin'):
-    # NOTE: The trailing space here is important. Do not remove it.
-    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-force_load '
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-force_load'
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
+    env['LINK_AS_NEEDED_LIB_START'] = '-Wl,-mark_dead_strippable_dylib'
+    env['LINK_AS_NEEDED_LIB_END'] = ''
 elif env.TargetOSIs('solaris'):
-    # NOTE: The leading and trailing spaces here are important. Do not remove them.
-    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-z,allextract '
-    env['LINK_WHOLE_ARCHIVE_LIB_END'] = ' -Wl,-z,defaultextract'
+    env['LINK_WHOLE_ARCHIVE_LIB_START'] = '-Wl,-z,allextract'
+    env['LINK_WHOLE_ARCHIVE_LIB_END'] = '-Wl,-z,defaultextract'
 elif env.TargetOSIs('windows'):
     env['LINK_WHOLE_ARCHIVE_LIB_START'] = '/WHOLEARCHIVE'
-    env['LINK_WHOLE_ARCHIVE_SEP'] = ':'
     env['LINK_WHOLE_ARCHIVE_LIB_END'] = ''
+    env['LIBDEPS_FLAG_SEPARATORS'] = {env['LINK_WHOLE_ARCHIVE_LIB_START']:{'suffix':':'}}
+
+def init_no_global_add_flags(env, start_flag, end_flag):
+    """ Helper function for init_no_global_libdeps_tag_expand"""
+    env.AppendUnique(LIBDEPS_PREFIX_FLAGS=[start_flag])
+    env.PrependUnique(LIBDEPS_POSTFIX_FLAGS=[end_flag])
+    if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
+        env.AppendUnique(
+            LIBDEPS_SWITCH_FLAGS=[{
+                'on':start_flag,
+                'off':end_flag
+        }])
+
+def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
+    """
+    This callable will be expanded by scons and modify the environment by
+    adjusting the prefix and postfix flags to account for linking options
+    related to the use of global static initializers for any given libdep.
+    """
+
+    if link_model.startswith("dynamic"):
+        start_flag = env.get('LINK_AS_NEEDED_LIB_START', '')
+        end_flag = env.get('LINK_AS_NEEDED_LIB_END', '')
+
+        # In the dynamic case, any library that is known to not have global static
+        # initializers can supply the flag and be wrapped in --as-needed linking,
+        # allowing the linker to be smart about linking libraries it may not need.
+        if "init-no-global-side-effects" in env.get(libdeps.Constants.LibdepsTags, []):
+            if env.TargetOSIs('darwin'):
+                # macos as-needed flag is used on the library directly when it is built
+                env.AppendUnique(SHLINKFLAGS=[start_flag])
+            else:
+                init_no_global_add_flags(env, start_flag, end_flag)
+
+    else:
+        start_flag = env.get('LINK_WHOLE_ARCHIVE_LIB_START', '')
+        end_flag = env.get('LINK_WHOLE_ARCHIVE_LIB_END', '')
+
+        # In the static case, any library that is unknown to have global static
+        # initializers should supply the flag and be wrapped in --whole-archive linking,
+        # allowing the linker to bring in all those symbols which may not be directly needed
+        # at link time.
+        if "init-no-global-side-effects" not in env.get(libdeps.Constants.LibdepsTags, []):
+            init_no_global_add_flags(env, start_flag, end_flag)
+
+    return []
+
+env['LIBDEPS_TAG_EXPANSIONS'].append(init_no_global_libdeps_tag_expand)
 
 # ---- other build setup -----
 if debugBuild:
@@ -1917,20 +1990,20 @@ elif env.TargetOSIs('windows'):
 
     env.Append(
         LIBS=[
-            'DbgHelp.lib',
-            'Iphlpapi.lib',
-            'Psapi.lib',
-            'advapi32.lib',
-            'bcrypt.lib',
-            'crypt32.lib',
-            'dnsapi.lib',
-            'kernel32.lib',
-            'shell32.lib',
-            'pdh.lib',
-            'version.lib',
-            'winmm.lib',
-            'ws2_32.lib',
-            'secur32.lib',
+            'DbgHelp',
+            'Iphlpapi',
+            'Psapi',
+            'advapi32',
+            'bcrypt',
+            'crypt32',
+            'dnsapi',
+            'kernel32',
+            'shell32',
+            'pdh',
+            'version',
+            'winmm',
+            'ws2_32',
+            'secur32',
         ],
     )
 
@@ -2039,7 +2112,11 @@ if env.TargetOSIs('posix'):
         except KeyError:
             pass
 
-    if env.TargetOSIs('linux') and has_option( "gcov" ):
+    if has_option( "gcov" ):
+        if not (env.TargetOSIs('linux') and env.ToolchainIs('gcc')):
+            # TODO: This should become supported under: https://jira.mongodb.org/browse/SERVER-49877
+            env.FatalError("Coverage option 'gcov' is currently only supported on linux with gcc. See SERVER-49877.")
+
         env.Append( CCFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
         env.Append( LINKFLAGS=["-fprofile-arcs", "-ftest-coverage", "-fprofile-update=single"] )
 
@@ -2768,31 +2845,19 @@ def doConfigure(myenv):
 
         sanitizer_list = get_option('sanitize').split(',')
 
+        using_asan = 'address' in sanitizer_list
+        using_fsan = 'fuzzer' in sanitizer_list
         using_lsan = 'leak' in sanitizer_list
-        using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
         using_ubsan = 'undefined' in sanitizer_list
-        using_fsan = 'fuzzer' in sanitizer_list
 
-        if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental'] and (using_lsan or using_asan):
+        if using_lsan:
+            env.FatalError("Please use --sanitize=address instead of --sanitize=leak")
+
+        if using_asan and env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
-            env.FatalError("Cannot use --sanitize=leak or --sanitize=address with tcmalloc")
-
-        # If the user asked for leak sanitizer, turn on the detect_leaks
-        # ASAN_OPTION. If they asked for address sanitizer as well, drop
-        # 'leak', because -fsanitize=leak means no address.
-        #
-        # --sanitize=leak:           -fsanitize=leak, detect_leaks=1
-        # --sanitize=address,leak:   -fsanitize=address, detect_leaks=1
-        # --sanitize=address:        -fsanitize=address
-        #
-        if using_lsan:
-            if using_asan:
-                myenv['ENV']['ASAN_OPTIONS'] = "detect_leaks=1"
-            myenv['ENV']['LSAN_OPTIONS'] = "suppressions=%s" % myenv.File("#etc/lsan.suppressions").abspath
-            if 'address' in sanitizer_list:
-                sanitizer_list.remove('leak')
+            env.FatalError("Cannot use --sanitize=address with tcmalloc")
 
         if using_fsan:
             def CheckForFuzzerCompilerSupport(context):
@@ -2856,7 +2921,6 @@ def doConfigure(myenv):
 
         blackfiles_map = {
             "address" : myenv.File("#etc/asan.blacklist"),
-            "leak" : myenv.File("#etc/asan.blacklist"),
             "thread" : myenv.File("#etc/tsan.blacklist"),
             "undefined" : myenv.File("#etc/ubsan.blacklist"),
         }
@@ -2881,7 +2945,15 @@ def doConfigure(myenv):
         # generator to return at command line expansion time so that
         # we can change the signature if the file contents change.
         if blackfiles:
-            blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+            # Unconditionally using the full path can affect SCons cached builds, so we only do
+            # this in cases where we know it's going to matter.
+            blackfile_paths = [
+                blackfile.get_abspath() if ('ICECC' in env and env['ICECC']) else blackfile.path
+                for blackfile in blackfiles
+            ]
+            # Make these files available to remote icecream builds if requested
+            blacklist_options=[f"-fsanitize-blacklist={file_path}" for file_path in blackfile_paths]
+            env.AppendUnique(ICECC_CREATE_ENV_ADDFILES=blackfile_paths)
             def SanitizerBlacklistGenerator(source, target, env, for_signature):
                 if for_signature:
                     return [f.get_csig() for f in blackfiles]
@@ -2892,21 +2964,20 @@ def doConfigure(myenv):
                 LINKFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
             )
 
-        llvm_symbolizer = get_option('llvm-symbolizer')
-        if os.path.isabs(llvm_symbolizer):
-            if not myenv.File(llvm_symbolizer).exists():
-                print("WARNING: Specified symbolizer '%s' not found" % llvm_symbolizer)
-                llvm_symbolizer = None
-        else:
-            llvm_symbolizer = myenv.WhereIs(llvm_symbolizer)
+        symbolizer_option = ""
+        if env['LLVM_SYMBOLIZER']:
+            llvm_symbolizer = env['LLVM_SYMBOLIZER']
 
-        tsan_options = ""
-        if llvm_symbolizer:
-            myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
-            myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
-            tsan_options = "external_symbolizer_path=\"%s\" " % llvm_symbolizer
-        elif using_lsan:
-            myenv.FatalError("Using the leak sanitizer requires a valid symbolizer")
+            if not os.path.isabs(llvm_symbolizer):
+                llvm_symbolizer = myenv.WhereIs(llvm_symbolizer)
+
+            if not myenv.File(llvm_symbolizer).exists():
+                myenv.FatalError(f"Symbolizer binary at path {llvm_symbolizer} does not exist")
+
+            symbolizer_option = f":external_symbolizer_path=\"{llvm_symbolizer}\""
+
+        elif using_asan or using_tsan or using_ubsan:
+            myenv.FatalError("The address, thread, and undefined behavior sanitizers require llvm-symbolizer for meaningful reports")
 
         if using_asan:
             # Unfortunately, abseil requires that we make these macros
@@ -2915,6 +2986,13 @@ def doConfigure(myenv):
             # compiler. We do this unconditionally because abseil is
             # basically pervasive via the 'base' library.
             myenv.AppendUnique(CPPDEFINES=['ADDRESS_SANITIZER'])
+            # If anything is changed, added, or removed in either asan_options or
+            # lsan_options, be sure to make the corresponding changes to the
+            # appropriate build variants in etc/evergreen.yml
+            asan_options = "detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1"
+            lsan_options = f"report_objects=1:suppressions={myenv.File('#etc/lsan.suppressions').abspath}"
+            env['ENV']['ASAN_OPTIONS'] = asan_options + symbolizer_option
+            env['ENV']['LSAN_OPTIONS'] = lsan_options + symbolizer_option
 
         if using_tsan:
 
@@ -2931,12 +3009,20 @@ def doConfigure(myenv):
                 # the benefits of libunwind. Fixing this is:
                 env.FatalError("Cannot use libunwind with TSAN, please add --use-libunwind=off to your compile flags")
 
-            # die_after_fork=0 is a temporary setting to allow tests to continue while we figure out why
-            # we're running afoul of it. If we remove it here, it also needs to be removed from the test
-            # variant in etc/evergreen.yml
-            # TODO: https://jira.mongodb.org/browse/SERVER-49121
-            tsan_options += "die_after_fork=0:suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
-            myenv['ENV']['TSAN_OPTIONS'] = tsan_options
+            # If anything is changed, added, or removed in
+            # tsan_options, be sure to make the corresponding changes
+            # to the appropriate build variants in etc/evergreen.yml
+            #
+            # TODO SERVER-49121: die_after_fork=0 is a temporary
+            # setting to allow tests to continue while we figure out
+            # why we're running afoul of it.
+            #
+            # TODO SERVER-48490: report_thread_leaks=0 suppresses
+            # reporting thread leaks, which we have because we don't
+            # do a clean shutdown of the ServiceContext.
+            #
+            tsan_options = f"halt_on_error=1:report_thread_leaks=0:die_after_fork=0:suppressions={myenv.File('#etc/tsan.suppressions').abspath}"
+            myenv['ENV']['TSAN_OPTIONS'] = tsan_options + symbolizer_option
             myenv.AppendUnique(CPPDEFINES=['THREAD_SANITIZER'])
 
         if using_ubsan:
@@ -2948,6 +3034,11 @@ def doConfigure(myenv):
             if not using_fsan and not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
                 AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
             myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
+            # If anything is changed, added, or removed in ubsan_options, be
+            # sure to make the corresponding changes to the appropriate build
+            # variants in etc/evergreen.yml
+            ubsan_options = "print_stacktrace=1"
+            myenv['ENV']['UBSAN_OPTIONS'] = ubsan_options + symbolizer_option
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -3006,8 +3097,11 @@ def doConfigure(myenv):
         # probably built with GCC. That combination appears to cause
         # false positives for the ODR detector. See SERVER-28133 for
         # additional details.
-        if (get_option('detect-odr-violations') and
-                not (myenv.ToolchainIs('clang') and usingLibStdCxx)):
+        if has_option('detect-odr-violations'):
+            if myenv.ToolchainIs('clang') and usingLibStdCxx:
+                env.FatalError('The --detect-odr-violations flag does not work with clang and libstdc++')
+            if optBuild:
+                env.FatalError('The --detect-odr-violations flag is expected to only be reliable with --opt=off')
             AddToLINKFLAGSIfSupported(myenv, '-Wl,--detect-odr-violations')
 
         # Disallow an executable stack. Also, issue a warning if any files are found that would
@@ -3663,28 +3757,6 @@ def doConfigure(myenv):
 
     conf.AddTest('CheckMongoCMinVersion', CheckMongoCMinVersion)
 
-    if env.TargetOSIs('darwin'):
-        def CheckMongoCFramework(context):
-            context.Message("Checking for mongoc_get_major_version() in darwin framework mongoc...")
-            test_body = """
-            #include <mongoc/mongoc.h>
-
-            int main() {
-                mongoc_get_major_version();
-
-                return EXIT_SUCCESS;
-            }
-            """
-
-            lastFRAMEWORKS = context.env['FRAMEWORKS']
-            context.env.Append(FRAMEWORKS=['mongoc'])
-            result = context.TryLink(textwrap.dedent(test_body), ".c")
-            context.Result(result)
-            context.env['FRAMEWORKS'] = lastFRAMEWORKS
-            return result
-
-        conf.AddTest('CheckMongoCFramework', CheckMongoCFramework)
-
     mongoc_mode = get_option('use-system-mongo-c')
     conf.env['MONGO_HAVE_LIBMONGOC'] = False
     if mongoc_mode != 'off':
@@ -3694,9 +3766,7 @@ def doConfigure(myenv):
                 "C",
                 "mongoc_get_major_version();",
                 autoadd=False ):
-            conf.env['MONGO_HAVE_LIBMONGOC'] = "library"
-        if not conf.env['MONGO_HAVE_LIBMONGOC'] and env.TargetOSIs('darwin') and conf.CheckMongoCFramework():
-            conf.env['MONGO_HAVE_LIBMONGOC'] = "framework"
+            conf.env['MONGO_HAVE_LIBMONGOC'] = True
         if not conf.env['MONGO_HAVE_LIBMONGOC'] and mongoc_mode == 'on':
             myenv.ConfError("Failed to find the required C driver headers")
         if conf.env['MONGO_HAVE_LIBMONGOC'] and not conf.CheckMongoCMinVersion():
@@ -3820,8 +3890,11 @@ if env.ToolchainIs("clang"):
 elif env.ToolchainIs("gcc"):
     env["ICECC_COMPILER_TYPE"] = "gcc"
 
-env.Tool('icecream')
-
+if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+    env['ICECREAM_TARGET_DIR'] = '$BUILD_ROOT/scons/icecream'
+    env.Tool('icecream', verbose=env.Verbose())
+else:
+    env.Tool('icecream')
 
 # Defaults for SCons provided flags. SetOption only sets the option to our value
 # if the user did not provide it. So for any flag here if it's explicitly passed
@@ -3875,11 +3948,9 @@ if get_option('ninja') != 'disabled':
         if env['ICECREAM_VERSION'] < parse_version("1.2"):
             env.FatalError("Use of ccache is mandatory with --ninja and icecream older than 1.2. You are running {}.".format(env['ICECREAM_VERSION']))
 
-    if get_option('ninja') == 'stable':
-        ninja_builder = Tool("ninja")
-        ninja_builder.generate(env)
-    else:
-        ninja_builder = Tool("ninja_next")
+    ninja_builder = Tool("ninja")
+    if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+        env["NINJA_BUILDDIR"] = env.Dir("$BUILD_DIR/ninja")
         ninja_builder.generate(env)
 
         ninjaConf = Configure(env, help=False, custom_tests = {
@@ -3888,6 +3959,24 @@ if get_option('ninja') != 'disabled':
         env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
         ninjaConf.Finish()
 
+        # TODO: API for getting the sconscripts programmatically
+        # exists upstream: https://github.com/SCons/scons/issues/3625
+        def ninja_generate_deps(env, target, source, for_signature):
+            dependencies = env.Flatten([
+                'SConstruct',
+                glob(os.path.join('src', '**', 'SConscript'), recursive=True),
+                glob(os.path.join(os.path.expanduser('~/.scons/'), '**', '*.py'), recursive=True),
+                glob(os.path.join('site_scons', '**', '*.py'), recursive=True),
+                glob(os.path.join('buildscripts', '**', '*.py'), recursive=True),
+                glob(os.path.join('src/third_party/scons-*', '**', '*.py'), recursive=True),
+                glob(os.path.join('src/mongo/db/modules', '**', '*.py'), recursive=True),
+            ])
+
+            return dependencies
+
+        env['NINJA_REGENERATE_DEPS'] = ninja_generate_deps
+    else:
+        ninja_builder.generate(env)
 
     # idlc.py has the ability to print it's implicit dependencies
     # while generating, Ninja can consume these prints using the
@@ -4132,13 +4221,28 @@ env.AddPackageNameAlias(
     name="mh-debugsymbols",
 )
 
+def rpath_generator(env, source, target, for_signature):
+    # If the PREFIX_LIBDIR has an absolute path, we will use that directly as
+    # RPATH because that indicates the final install destination of the libraries.
+    prefix_libdir = env.subst('$PREFIX_LIBDIR')
+    if  os.path.isabs(prefix_libdir):
+        return ['$PREFIX_LIBDIR']
+
+    # If the PREFIX_LIBDIR is not an absolute path, we will use a relative path
+    # from the bin to the lib dir.
+    lib_rel = os.path.relpath(prefix_libdir, env.subst('$PREFIX_BINDIR'))
+
+    if env['PLATFORM'] == 'posix':\
+        return [env.Literal(f"\\$$ORIGIN/{lib_rel}")]
+
+    if env['PLATFORM'] == 'darwin':
+        return [f"@loader_path/{lib_rel}",]
+
+env['RPATH_GENERATOR'] = rpath_generator
+
 if env['PLATFORM'] == 'posix':
     env.AppendUnique(
-        RPATH=[
-            # In the future when we want to improve dynamic builds
-            # we should set this to $PREFIX ideally
-             env.Literal('\\$$ORIGIN/../lib'),
-        ],
+        RPATH='$RPATH_GENERATOR',
         LINKFLAGS=[
             # Most systems *require* -z,origin to make origin work, but android
             # blows up at runtime if it finds DF_ORIGIN_1 in DT_FLAGS_1.
@@ -4153,11 +4257,15 @@ if env['PLATFORM'] == 'posix':
         ]
     )
 elif env['PLATFORM'] == 'darwin':
+    # The darwin case uses a adhoc implementation of RPATH for SCons
+    # since SCons does not support RPATH directly for macOS:
+    #   https://github.com/SCons/scons/issues/2127
+    # so we setup RPATH and LINKFLAGS ourselves.
+    env['RPATHPREFIX'] = '-Wl,-rpath,'
+    env['RPATHSUFFIX'] = ''
+    env['RPATH'] = '$RPATH_GENERATOR'
     env.AppendUnique(
-        LINKFLAGS=[
-            '-Wl,-rpath,@loader_path/../lib',
-            '-Wl,-rpath,@loader_path/../Frameworks'
-        ],
+        LINKFLAGS="${_concat(RPATHPREFIX, RPATH, RPATHSUFFIX, __env__)}",
         SHLINKFLAGS=[
             "-Wl,-install_name,@rpath/${TARGET.file}",
         ],

@@ -71,6 +71,57 @@ void IndexBuildBlock::finalizeTemporaryTables(OperationContext* opCtx,
     }
 }
 
+void IndexBuildBlock::_completeInit(OperationContext* opCtx, Collection* collection) {
+    // Register this index with the CollectionQueryInfo to regenerate the cache. This way, updates
+    // occurring while an index is being build in the background will be aware of whether or not
+    // they need to modify any indexes.
+    CollectionQueryInfo::get(collection)
+        .addedIndex(opCtx, collection, _indexCatalogEntry->descriptor());
+}
+
+Status IndexBuildBlock::initForResume(OperationContext* opCtx,
+                                      Collection* collection,
+                                      const IndexSorterInfo& sorterInfo,
+                                      IndexBuildPhaseEnum phase) {
+
+    _indexName = _spec.getStringField("name");
+    auto descriptor =
+        _indexCatalog->findIndexByName(opCtx, _indexName, true /* includeUnfinishedIndexes */);
+
+    _indexCatalogEntry = descriptor->getEntry();
+
+    uassert(4945000,
+            "Index catalog entry not found while attempting to resume index build",
+            _indexCatalogEntry);
+    uassert(
+        4945001, "Cannot resume a non-hybrid index build", _method == IndexBuildMethod::kHybrid);
+
+    if (phase == IndexBuildPhaseEnum::kBulkLoad) {
+        // A bulk cursor can only be opened on a fresh table, so we drop the table that was created
+        // before shutdown and recreate it.
+        auto status = DurableCatalog::get(opCtx)->dropAndRecreateIndexIdentForResume(
+            opCtx,
+            collection->getCatalogId(),
+            descriptor,
+            _indexCatalogEntry->getIdent(),
+            _indexCatalogEntry->getPrefix());
+        if (!status.isOK())
+            return status;
+    }
+
+    _indexBuildInterceptor =
+        std::make_unique<IndexBuildInterceptor>(opCtx,
+                                                _indexCatalogEntry,
+                                                sorterInfo.getSideWritesTable(),
+                                                sorterInfo.getDuplicateKeyTrackerTable(),
+                                                sorterInfo.getSkippedRecordTrackerTable());
+    _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
+
+    _completeInit(opCtx, collection);
+
+    return Status::OK();
+}
+
 Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
@@ -118,11 +169,7 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
             });
     }
 
-    // Register this index with the CollectionQueryInfo to regenerate the cache. This way, updates
-    // occurring while an index is being build in the background will be aware of whether or not
-    // they need to modify any indexes.
-    CollectionQueryInfo::get(collection)
-        .addedIndex(opCtx, collection, _indexCatalogEntry->descriptor());
+    _completeInit(opCtx, collection);
 
     return Status::OK();
 }

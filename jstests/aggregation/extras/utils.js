@@ -28,7 +28,7 @@ function testExpressionWithCollation(coll, expression, result, collationSpec) {
  * with the exception of '_id'. If 'al' and 'ar' are neither object nor arrays, they must compare
  * equal using 'valueComparator', or == if not provided.
  */
-function anyEq(al, ar, verbose = false, valueComparator) {
+function anyEq(al, ar, verbose = false, valueComparator, fieldsToSkip = []) {
     const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
 
     if (al instanceof Array) {
@@ -49,7 +49,7 @@ function anyEq(al, ar, verbose = false, valueComparator) {
             return false;
         }
 
-        if (!documentEq(al, ar, verbose, valueComparator)) {
+        if (!documentEq(al, ar, verbose, valueComparator, fieldsToSkip)) {
             debug(`anyEq: documentEq(al, ar): false; al=${tojson(al)}, ar=${tojson(ar)}`);
             return false;
         }
@@ -74,9 +74,10 @@ function customDocumentEq({left, right, verbose, valueComparator}) {
 
 /**
  * Compare two documents for equality. Returns true or false. Only equal if they have the exact same
- * set of properties, and all the properties' values match.
+ * set of properties, and all the properties' values match except the values with names in the
+ * fieldsToSkip array. The fields in fieldsToSkip will be skipped at all levels of the document.
  */
-function documentEq(dl, dr, verbose = false, valueComparator) {
+function documentEq(dl, dr, verbose = false, valueComparator, fieldsToSkip = []) {
     const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
 
     // Make sure these are both objects.
@@ -102,10 +103,10 @@ function documentEq(dl, dr, verbose = false, valueComparator) {
         }
 
         // If the property is the _id, they don't have to be equal.
-        if (propertyName == '_id')
+        if (propertyName == '_id' || fieldsToSkip.includes(propertyName))
             continue;
 
-        if (!anyEq(dl[propertyName], dr[propertyName], verbose, valueComparator)) {
+        if (!anyEq(dl[propertyName], dr[propertyName], verbose, valueComparator, fieldsToSkip)) {
             return false;
         }
     }
@@ -134,7 +135,7 @@ function documentEq(dl, dr, verbose = false, valueComparator) {
  * This is a predicate, not an assertion; use assert.sameMembers() in assert.js for the
  * equivalent assertion.
  */
-function arrayEq(al, ar, verbose = false, valueComparator) {
+function arrayEq(al, ar, verbose = false, valueComparator, fieldsToSkip = []) {
     const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
 
     // Check that these are both arrays.
@@ -159,7 +160,7 @@ function arrayEq(al, ar, verbose = false, valueComparator) {
         let foundMatch = false;
         for (let i = 0; i < ar.length; ++i) {
             if (!matchedElementsInRight.has(i) &&
-                anyEq(leftElem, ar[i], verbose, valueComparator)) {
+                anyEq(leftElem, ar[i], verbose, valueComparator, fieldsToSkip)) {
                 matchedElementsInRight.add(i);  // Don't use the same value each time.
                 foundMatch = true;
                 break;
@@ -270,6 +271,14 @@ function assertErrorCode(coll, pipe, code, errmsg, options = {}) {
     } else {
         assert.eq(cursorRes.code, code, tojson(cursorRes));
     }
+}
+
+/**
+ * Assert that an aggregation fails with a list of specific codes.
+ */
+function assertErrorCodes(coll, pipe, codes) {
+    const response = assert.commandFailedWithCode(
+        coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}), codes);
 }
 
 /**

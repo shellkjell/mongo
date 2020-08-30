@@ -29,8 +29,10 @@
 
 #pragma once
 
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/query/projection.h"
 
 namespace mongo::stage_builder {
@@ -40,10 +42,12 @@ namespace mongo::stage_builder {
  * variable to read the input document from.
  */
 std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateProjection(
+    OperationContext* opCtx,
     const projection_ast::Projection* proj,
     std::unique_ptr<sbe::PlanStage> stage,
     sbe::value::SlotIdGenerator* slotIdGenerator,
     sbe::value::FrameIdGenerator* frameIdGenerator,
-    sbe::value::SlotId inputVar);
+    sbe::value::SlotId inputVar,
+    sbe::RuntimeEnvironment* env);
 
 }  // namespace mongo::stage_builder

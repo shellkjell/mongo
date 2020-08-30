@@ -43,11 +43,11 @@ const NamespaceString kTestNss("TestDB", "TestColl");
 
 void setCollectionFilteringMetadata(OperationContext* opCtx, CollectionMetadata metadata) {
     AutoGetCollection autoColl(opCtx, kTestNss, MODE_X);
+    const auto version = metadata.getShardVersion();
     CollectionShardingRuntime::get(opCtx, kTestNss)
         ->setFilteringMetadata(opCtx, std::move(metadata));
 
     auto& oss = OperationShardingState::get(opCtx);
-    const auto version = metadata.getShardVersion();
     BSONObjBuilder builder;
     version.appendToCommand(&builder);
     oss.initializeClientRoutingVersionsFromCommand(kTestNss, builder.obj());
@@ -65,9 +65,8 @@ CollectionMetadata makeAMetadata(BSONObj const& keyPattern) {
     auto chunk = ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
     auto rt = RoutingTableHistory::makeNew(
         kTestNss, UUID::gen(), KeyPattern(keyPattern), nullptr, false, epoch, {std::move(chunk)});
-    std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, Timestamp(100, 0));
 
-    return CollectionMetadata(std::move(cm), ShardId("this"));
+    return CollectionMetadata(ChunkManager(rt, Timestamp(100, 0)), ShardId("this"));
 }
 
 class DeleteStateTest : public ShardServerTestFixture {};

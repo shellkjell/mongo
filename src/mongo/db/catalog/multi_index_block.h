@@ -46,6 +46,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/resumable_index_builds_gen.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/fail_point.h"
 
@@ -61,8 +62,8 @@ class OperationContext;
 /**
  * Builds one or more indexes.
  *
- * If any method other than insert() returns a not-ok Status, this MultiIndexBlock should be
- * considered failed and must be destroyed.
+ * If any method other than insertSingleDocumentForInitialSyncOrRecovery() returns a not-ok Status,
+ * this MultiIndexBlock should be considered failed and must be destroyed.
  *
  * If a MultiIndexBlock is destroyed before commit() or if commit() is rolled back, it will
  * clean up all traces of the indexes being constructed. MultiIndexBlocks should not be
@@ -108,14 +109,20 @@ public:
      * Requires holding an exclusive lock on the collection.
      */
     using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
-    StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
-                                          Collection* collection,
-                                          const std::vector<BSONObj>& specs,
-                                          OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> init(
+        OperationContext* opCtx,
+        Collection* collection,
+        const std::vector<BSONObj>& specs,
+        OnInitFn onInit,
+        const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
                                           Collection* collection,
                                           const BSONObj& spec,
                                           OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> initForResume(OperationContext* opCtx,
+                                                   Collection* collection,
+                                                   const std::vector<BSONObj>& specs,
+                                                   const ResumeIndexInfo& resumeInfo);
 
     /**
      * Not all index initializations need an OnInitFn, in particular index builds that do not need
@@ -133,8 +140,8 @@ public:
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
      *
-     * This is a simplified replacement for insert and doneInserting. Do not call this if you
-     * are calling either of them.
+     * This is a replacement for calling both insertSingleDocumentForInitialSyncOrRecovery and
+     * dumpInsertsFromBulk. Do not call this if you are calling either of them.
      *
      * Will fail if violators of uniqueness constraints exist.
      *
@@ -142,7 +149,10 @@ public:
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status insertAllDocumentsInCollection(OperationContext* opCtx, Collection* collection);
+    Status insertAllDocumentsInCollection(
+        OperationContext* opCtx,
+        Collection* collection,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Call this after init() for each document in the collection.
@@ -151,24 +161,24 @@ public:
      *
      * Should be called inside of a WriteUnitOfWork.
      */
-    Status insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
+    Status insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
+                                                        const BSONObj& wholeDocument,
+                                                        const RecordId& loc);
 
     /**
-     * Call this after the last insert(). This gives the index builder a chance to do any
-     * long-running operations in separate units of work from commit().
+     * Call this after the last insertSingleDocumentForInitialSyncOrRecovery(). This gives the index
+     * builder a chance to do any long-running operations in separate units of work from commit().
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
-     * If 'dupRecords' is passed as non-NULL and duplicates are not allowed for the index, violators
-     * of uniqueness constraints will be added to the set. Records added to this set are not
-     * indexed, so callers MUST either fail this index build or delete the documents from the
-     * collection.
+     * If 'onDuplicateRecord' is passed as non-NULL and duplicates are not allowed for the index,
+     * violators of uniqueness constraints will be handled by 'onDuplicateRecord'.
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
     Status dumpInsertsFromBulk(OperationContext* opCtx);
-    Status dumpInsertsFromBulk(OperationContext* opCtx, std::set<RecordId>* const dupRecords);
-
+    Status dumpInsertsFromBulk(OperationContext* opCtx,
+                               const IndexAccessMethod::RecordIdHandlerFn& onDuplicateRecord);
     /**
      * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
      * drain these writes into the index. If intent locks are held on the collection, more writes
@@ -209,7 +219,7 @@ public:
 
     /**
      * Marks the index ready for use. Should only be called as the last method after
-     * doneInserting() or insertAllDocumentsInCollection() return success.
+     * dumpInsertsFromBulk() or insertAllDocumentsInCollection() return success.
      *
      * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
      * logOp() should be called from the same unit of work as commit().
@@ -261,9 +271,13 @@ public:
      * not perform any storage engine writes. May delete internal tables, but this is not
      * transactional.
      *
+     * If the indexes being built were resumable, returns the information to resume them.
+     * Otherwise, returns boost::none.
+     *
      * This should only be used during rollback.
      */
-    void abortWithoutCleanupForRollback(OperationContext* opCtx);
+    boost::optional<ResumeIndexInfo> abortWithoutCleanupForRollback(OperationContext* opCtx,
+                                                                    bool isResumable);
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
@@ -274,7 +288,7 @@ public:
      *
      * This should only be used during shutdown.
      */
-    void abortWithoutCleanupForShutdown(OperationContext* opCtx);
+    void abortWithoutCleanupForShutdown(OperationContext* opCtx, bool isResumable);
 
     /**
      * Returns true if this build block supports background writes while building an index. This is
@@ -295,17 +309,20 @@ private:
         InsertDeleteOptions options;
     };
 
-    enum class Phase { kInitialized, kCollectionScan, kBulkLoad, kDrainWrites };
-
-    void _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
-
-    bool _shouldWriteStateToDisk(OperationContext* opCtx, bool shutdown) const;
+    /**
+     * This function should be used for shutdown and rollback. When called for shutdown, writes the
+     * resumable index build state to disk if resumable index builds are supported. When called for
+     * rollback, returns the information to resume the index build if resumable index builds are
+     * supported.
+     */
+    boost::optional<ResumeIndexInfo> _abortWithoutCleanup(OperationContext* opCtx,
+                                                          bool shutdown,
+                                                          bool isResumable);
 
     void _writeStateToDisk(OperationContext* opCtx) const;
 
     BSONObj _constructStateObject() const;
 
-    std::string _phaseToString(Phase phase) const;
 
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
@@ -329,6 +346,6 @@ private:
     boost::optional<RecordId> _lastRecordIdInserted;
 
     // The current phase of the index build.
-    Phase _phase = Phase::kInitialized;
+    IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
 };
 }  // namespace mongo

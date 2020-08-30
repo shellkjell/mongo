@@ -248,7 +248,8 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
 
     // Construct the query and parameters. Defer setting skip and limit here until
     // we determine if the query is targeting multi-shards or a single shard below.
-    ClusterClientCursorParams params(query.nss(), readPref, ReadConcernArgs::get(opCtx));
+    ClusterClientCursorParams params(
+        query.nss(), APIParameters::get(opCtx), readPref, ReadConcernArgs::get(opCtx));
     params.originatingCommandObj = CurOp::get(opCtx)->opDescription().getOwned();
     params.batchSize = query.getQueryRequest().getEffectiveBatchSize();
     params.tailableMode = query.getQueryRequest().getTailableMode();
@@ -440,6 +441,8 @@ Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
         ReadConcernArgs::get(opCtx) = *readConcern;
     }
 
+    APIParameters::get(opCtx) = cursor->getAPIParameters();
+
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
     // that if the 'getMore' command itself has a 'comment' field, we give precedence to it.
     auto comment = cursor->getOriginatingCommand()["comment"];
@@ -525,16 +528,15 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             LOGV2_DEBUG(22839,
                         1,
-                        "Received error status for query {query} on attempt {attemptNumber} of "
-                        "{maxRetries}: {error}",
                         "Received error status for query",
                         "query"_attr = redact(query.toStringShort()),
                         "attemptNumber"_attr = retries,
                         "maxRetries"_attr = kMaxRetries,
                         "error"_attr = redact(ex));
 
+            // Mark database entry in cache as stale.
             Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
-                                                                     ex->getVersionReceived());
+                                                                     ex->getVersionWanted());
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 if (!txnRouter.canContinueOnStaleShardOrDbError(kFindCmdName, ex.toStatus())) {
@@ -567,8 +569,6 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             LOGV2_DEBUG(22840,
                         1,
-                        "Received error status for query {query} on attempt {attemptNumber} of "
-                        "{maxRetries}: {error}",
                         "Received error status for query",
                         "query"_attr = redact(query.toStringShort()),
                         "attemptNumber"_attr = retries,

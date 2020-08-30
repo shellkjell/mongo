@@ -34,6 +34,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -166,7 +167,12 @@ void updateShardKeyValueOnWouldChangeOwningShardError(OperationContext* opCtx,
 
 class FindAndModifyCmd : public BasicCommand {
 public:
-    FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
+    FindAndModifyCmd()
+        : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -205,13 +211,13 @@ public:
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
-        std::shared_ptr<ChunkManager> chunkMgr;
+        boost::optional<ChunkManager> chunkMgr;
         std::shared_ptr<Shard> shard;
 
         if (!routingInfo.cm()) {
             shard = routingInfo.db().primary();
         } else {
-            chunkMgr = routingInfo.cm();
+            chunkMgr.emplace(*routingInfo.cm());
 
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj collation = getCollation(cmdObj);
@@ -269,6 +275,9 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+
+        // Collect metrics.
+        _updateMetrics.collectMetrics(cmdObj);
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
@@ -413,6 +422,9 @@ private:
         result->appendElementsUnique(
             CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } findAndModifyCmd;
 
 }  // namespace

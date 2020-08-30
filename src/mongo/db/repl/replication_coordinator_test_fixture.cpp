@@ -153,9 +153,8 @@ void ReplCoordTest::init() {
                                                          replicationProcess,
                                                          _storageInterface,
                                                          seed);
-    service->setFastClockSource(std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
-    service->setPreciseClockSource(
-        std::make_unique<executor::NetworkInterfaceMockClockSource>(_net));
+    service->setFastClockSource(std::make_unique<ClockSourceMock>());
+    service->setPreciseClockSource(std::make_unique<ClockSourceMock>());
 }
 
 void ReplCoordTest::init(const ReplSettings& settings) {
@@ -180,7 +179,7 @@ void ReplCoordTest::start() {
     }
 
     const auto opCtx = makeOperationContext();
-    _repl->startup(opCtx.get());
+    _repl->startup(opCtx.get(), LastStorageEngineShutdownState::kClean);
     _repl->waitForStartUpComplete_forTest();
     // _rsConfig should be written down at this point, so populate _memberData accordingly.
     _topo->populateAllMembersConfigVersionAndTerm_forTest();

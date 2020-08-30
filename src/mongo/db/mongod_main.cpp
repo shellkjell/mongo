@@ -77,6 +77,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/fcv_op_observer.h"
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
@@ -111,6 +112,8 @@
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/primary_only_service_op_observer.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
@@ -121,6 +124,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/tenant_migration_donor_service.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
@@ -155,7 +159,6 @@
 #include "mongo/db/system_index.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -184,6 +187,7 @@
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/latch_analyzer.h"
 #include "mongo/util/net/ocsp/ocsp_manager.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -191,7 +195,6 @@
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
-#include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/signal_handlers.h"
@@ -218,6 +221,7 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceMode);
 MONGO_FAIL_POINT_DEFINE(pauseWhileKillingOperationsAtShutdown);
+MONGO_FAIL_POINT_DEFINE(hangBeforeShutdown);
 
 const NamespaceString startupLogCollectionName("local.startup_log");
 
@@ -269,19 +273,18 @@ void logStartup(OperationContext* opCtx) {
     wunit.commit();
 }
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     // The featureCompatibilityVersion behavior defaults to the downgrade behavior while the
     // in-memory version is unset.
-
+    WireSpec::Specification spec;
     spec.incomingInternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.isInternalClient = true;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 void initializeCommandHooks(ServiceContext* serviceContext) {
@@ -297,12 +300,17 @@ void initializeCommandHooks(ServiceContext* serviceContext) {
     CommandInvocationHooks::set(serviceContext, std::make_shared<MongodCommandInvocationHooks>());
 }
 
+void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(serviceContext);
+    std::unique_ptr<TenantMigrationDonorService> tenantMigrationDonorService =
+        std::make_unique<TenantMigrationDonorService>(serviceContext);
+    registry->registerService(std::move(tenantMigrationDonorService));
+}
+
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
 ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
-
-    initWireSpec();
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
 
@@ -342,7 +350,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     auto runner = makePeriodicRunner(serviceContext);
     serviceContext->setPeriodicRunner(std::move(runner));
 
-    OCSPManager::get()->startThreadPool();
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::start(serviceContext);
+    CertificateExpirationMonitor::get()->start(serviceContext);
+#endif
 
     if (!storageGlobalParams.repair) {
         auto tl =
@@ -362,7 +373,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                      std::make_unique<FlowControl>(
                          serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+    auto lastStorageEngineShutdownState =
+        initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
     StorageControl::startStorageControls(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -435,7 +447,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     // When starting up after an unclean shutdown, we do not attempt to use any of the temporary
     // files left from the previous run. Thus, we remove them in this case.
-    if (!storageGlobalParams.readOnly && startingAfterUncleanShutdown(serviceContext)) {
+    if (!storageGlobalParams.readOnly &&
+        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
     }
 
@@ -446,7 +459,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
     try {
-        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get());
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(),
+                                                    lastStorageEngineShutdownState);
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
         LOGV2_FATAL_OPTIONS(
             20573,
@@ -460,14 +474,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
     // error.
     FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
-
-    // This flag is used during storage engine initialization to perform behavior that is specific
-    // to recovering from an unclean shutdown. It is also used to determine whether temporary files
-    // should be removed. The last of these uses is done by repairDatabasesAndCheckVersion() above,
-    // so we reset the flag to false here. We reset the flag so that other users of these functions
-    // outside of startup do not perform behavior that is specific to starting up after an unclean
-    // shutdown.
-    startingAfterUncleanShutdown(serviceContext) = false;
 
     if (gFlowControlEnabled.load()) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
@@ -598,7 +604,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         uassert(ErrorCodes::BadValue,
                 str::stream() << "Cannot use queryableBackupMode in a replica set",
                 !replCoord->isReplEnabled());
-        replCoord->startup(startupOpCtx.get());
+        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
     }
 
     if (!storageGlobalParams.readOnly) {
@@ -649,7 +655,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext)->startup();
         }
 
-        replCoord->startup(startupOpCtx.get());
+        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
             LOGV2_WARNING_OPTIONS(
                 20547,
@@ -712,16 +718,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // operation context anymore
     startupOpCtx.reset();
 
-    auto start = serviceContext->getServiceExecutor()->start();
-    if (!start.isOK()) {
-        LOGV2_ERROR(20570,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = start);
-        return EXIT_NET_ERROR;
-    }
-
-    start = serviceContext->getServiceEntryPoint()->start();
+    auto start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
         LOGV2_ERROR(20571,
                     "Error starting service entry point: {error}",
@@ -981,6 +978,10 @@ void setUpReplication(ServiceContext* serviceContext) {
     repl::setOplogCollectionName(serviceContext);
 
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+
+    // Register primary-only services here so that the services are started up when the replication
+    // coordinator starts up.
+    registerPrimaryOnlyServices(serviceContext);
 }
 
 void setUpObservers(ServiceContext* serviceContext) {
@@ -995,6 +996,9 @@ void setUpObservers(ServiceContext* serviceContext) {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
     }
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
+    opObserverRegistry->addObserver(
+        std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
+    opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
 
@@ -1032,6 +1036,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         shutdownTimeout = Milliseconds(repl::shutdownTimeoutMillisForSignaledShutdown.load());
     }
 
+    if (MONGO_unlikely(hangBeforeShutdown.shouldFail())) {
+        LOGV2(4944800, "Hanging before shutdown due to hangBeforeShutdown failpoint");
+        hangBeforeShutdown.pauseWhileSet();
+    }
+
     // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
     // path.
     //
@@ -1060,9 +1069,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                 (opCtx->getServiceContext()->getPreciseClockSource()->now() - stepDownStartTime));
     }
 
-    // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
-    if (serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kVersion451)) {
+    // TODO SERVER-49138: Remove this FCV check when 5.0 becomes last-lts.
+    // We must FCV gate the Quiesce mode feature so that a 4.7+ node entering Quiesce mode in a
+    // mixed 4.4/4.7+ replica set does not delay a 4.4 node from finding a valid sync source.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
         if (auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
             replCoord && replCoord->enterQuiesceModeIfSecondary(shutdownTimeout)) {
             ServiceContext::UniqueOperationContext uniqueOpCtx;
@@ -1093,6 +1105,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     LOGV2_OPTIONS(4784902, {LogComponent::kSharding}, "Shutting down the WaitForMajorityService");
     WaitForMajorityService::get(serviceContext).shutDown();
+
+    LOGV2_OPTIONS(
+        5006600, {LogComponent::kReplication}, "Shutting down the PrimaryOnlyServiceRegistry");
+    repl::PrimaryOnlyServiceRegistry::get(serviceContext)->shutdown();
 
     // Join the logical session cache before the transport layer.
     if (auto lsc = LogicalSessionCache::get(serviceContext)) {
@@ -1243,11 +1259,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         CatalogCacheLoader::get(serviceContext).shutDown();
     }
 
-#if __has_feature(address_sanitizer)
-    // When running under address sanitizer, we get false positive leaks due to disorder around
-    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-    // harder to dry up the server from active connections before going on to really shut down.
-
     // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
     if (auto sep = serviceContext->getServiceEntryPoint()) {
         LOGV2_OPTIONS(4784923, {LogComponent::kCommand}, "Shutting down the ServiceEntryPoint");
@@ -1257,19 +1268,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                           "Service entry point did not shutdown within the time limit");
         }
     }
-
-    // Shutdown and wait for the service executor to exit
-    if (auto svcExec = serviceContext->getServiceExecutor()) {
-        LOGV2_OPTIONS(4784924, {LogComponent::kExecutor}, "Shutting down the service executor");
-        Status status = svcExec->shutdown(Seconds(10));
-        if (!status.isOK()) {
-            LOGV2_OPTIONS(20564,
-                          {LogComponent::kNetwork},
-                          "Service executor did not shutdown within the time limit",
-                          "error"_attr = status);
-        }
-    }
-#endif
 
     LOGV2(4784925, "Shutting down free monitoring");
     stopFreeMonitoring();
@@ -1313,6 +1311,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
+#endif
+
+    FlowControl::shutdown(serviceContext);
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::shutdown(serviceContext);
 #endif
 }
 

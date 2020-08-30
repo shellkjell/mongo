@@ -64,7 +64,6 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_liaison_mongos.h"
@@ -91,6 +90,7 @@
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sessions_collection_sharded.h"
@@ -112,6 +112,7 @@
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/latch_analyzer.h"
 #include "mongo/util/net/ocsp/ocsp_manager.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -288,9 +289,10 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
         // At this point, we will start responding to any isMaster request with ShutdownInProgress
         // so that clients can re-route their operations.
         //
-        // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
-        if (serverGlobalParams.featureCompatibility.isVersion(
-                ServerGlobalParams::FeatureCompatibility::Version::kVersion451);
+        // TODO SERVER-49138: Remove this FCV check when 5.0 becomes last-lts.
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                    ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
             auto mongosTopCoord = MongosTopologyCoordinator::get(opCtx)) {
             mongosTopCoord->enterQuiesceModeAndWait(opCtx, quiesceTime);
         }
@@ -357,11 +359,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             CatalogCacheLoader::get(serviceContext).shutDown();
         }
 
-#if __has_feature(address_sanitizer)
-        // When running under address sanitizer, we get false positive leaks due to disorder around
-        // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-        // harder to dry up the server from active connections before going on to really shut down.
-
         // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
         if (auto sep = serviceContext->getServiceEntryPoint()) {
             if (!sep->shutdown(Seconds(10))) {
@@ -371,18 +368,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             }
         }
 
-        // Shutdown and wait for the service executor to exit
-        if (auto svcExec = serviceContext->getServiceExecutor()) {
-            Status status = svcExec->shutdown(Seconds(5));
-            if (!status.isOK()) {
-                LOGV2_OPTIONS(22845,
-                              {LogComponent::kNetwork},
-                              "Service executor did not shutdown within the time limit",
-                              "error"_attr = status);
-            }
-        }
-#endif
-
         // Shutdown Full-Time Data Capture
         stopMongoSFTDC();
     }
@@ -391,6 +376,10 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
 
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
+#endif
+
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::shutdown(serviceContext);
 #endif
 }
 
@@ -421,7 +410,8 @@ Status initializeSharding(OperationContext* opCtx) {
     CatalogCacheLoader::set(opCtx->getServiceContext(),
                             std::make_unique<ConfigServerCatalogCacheLoader>());
 
-    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+    auto catalogCache =
+        std::make_unique<CatalogCache>(opCtx->getServiceContext(), CatalogCacheLoader::get(opCtx));
 
     // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
     // removed.
@@ -487,15 +477,16 @@ Status initializeSharding(OperationContext* opCtx) {
     return Status::OK();
 }
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     // Since the upgrade order calls for upgrading mongos last, it only needs to talk the latest
     // wire version. This ensures that users will get errors if they upgrade in the wrong order.
+    WireSpec::Specification spec;
     spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.isInternalClient = true;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 class ShardingReplicaSetChangeListener final
@@ -660,15 +651,16 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     logShardingVersionInfo(nullptr);
 
-    initWireSpec();
-
     // Set up the periodic runner for background job execution
     {
         auto runner = makePeriodicRunner(serviceContext);
         serviceContext->setPeriodicRunner(std::move(runner));
     }
 
-    OCSPManager::get()->startThreadPool();
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::start(serviceContext);
+    CertificateExpirationMonitor::get()->start(serviceContext);
+#endif
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongos>(serviceContext));
 
@@ -773,9 +765,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     clusterCursorCleanupJob.go();
 
-    UserCacheInvalidator cacheInvalidatorThread(AuthorizationManager::get(serviceContext));
-    cacheInvalidatorThread.initialize(opCtx);
-    cacheInvalidatorThread.go();
+    UserCacheInvalidator::start(serviceContext, opCtx);
 
     PeriodicTask::startRunningPeriodicTasks();
 
@@ -787,15 +777,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
         std::make_unique<LogicalSessionCacheImpl>(std::make_unique<ServiceLiaisonMongos>(),
                                                   std::make_unique<SessionsCollectionSharded>(),
                                                   RouterSessionCatalog::reapSessionsOlderThan));
-
-    status = serviceContext->getServiceExecutor()->start();
-    if (!status.isOK()) {
-        LOGV2_ERROR(22859,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = redact(status));
-        return EXIT_NET_ERROR;
-    }
 
     status = serviceContext->getServiceEntryPoint()->start();
     if (!status.isOK()) {
@@ -904,7 +885,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
                                      ("EndStartupOptionStorage"))
 // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 (InitializerContext* context) {
-    serverGlobalParams.featureCompatibility.setVersion(
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::kLatest);
     return Status::OK();
 }

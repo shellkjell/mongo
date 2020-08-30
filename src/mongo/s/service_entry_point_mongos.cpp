@@ -33,6 +33,7 @@
 
 #include "mongo/s/service_entry_point_mongos.h"
 
+#include "mongo/client/server_is_master_monitor.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
@@ -60,7 +61,8 @@ BSONObj buildErrReply(const DBException& ex) {
 }  // namespace
 
 
-DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const Message& message) {
+Future<DbResponse> ServiceEntryPointMongos::handleRequest(OperationContext* opCtx,
+                                                          const Message& message) noexcept try {
     const int32_t msgId = message.header().getId();
     const NetworkOp op = message.operation();
 
@@ -90,11 +92,19 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
     if (op == dbMsg || (op == dbQuery && NamespaceString(dbm.getns()).isCommand())) {
         auto dbResponse = Strategy::clientCommand(opCtx, message);
 
+        // Hello should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        boost::optional<long long> slowMsOverride;
+        if (auto command = CurOp::get(opCtx)->getCommand();
+            command && (command->getName() == "hello")) {
+            slowMsOverride =
+                2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
+        }
+
         // Mark the op as complete, populate the response length, and log it if appropriate.
         CurOp::get(opCtx)->completeAndLogOperation(
-            opCtx, logv2::LogComponent::kCommand, dbResponse.response.size());
+            opCtx, logv2::LogComponent::kCommand, dbResponse.response.size(), slowMsOverride);
 
-        return dbResponse;
+        return Future<DbResponse>::makeReady(std::move(dbResponse));
     }
 
     NamespaceString nss;
@@ -179,7 +189,10 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
     CurOp::get(opCtx)->completeAndLogOperation(
         opCtx, logv2::LogComponent::kCommand, dbResponse.response.size());
 
-    return dbResponse;
+    return Future<DbResponse>::makeReady(std::move(dbResponse));
+} catch (const DBException& e) {
+    LOGV2(4879803, "Failed to handle request", "error"_attr = redact(e));
+    return e.toStatus();
 }
 
 }  // namespace mongo

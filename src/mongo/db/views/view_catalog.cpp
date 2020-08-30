@@ -41,7 +41,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
@@ -94,11 +93,7 @@ Status ViewCatalog::reload(OperationContext* opCtx, ViewCatalogLookupBehavior lo
 Status ViewCatalog::_reload(WithLock,
                             OperationContext* opCtx,
                             ViewCatalogLookupBehavior lookupBehavior) {
-    LOGV2_DEBUG(22546,
-                1,
-                "Reloading view catalog for database {db}",
-                "Reloading view catalog for database",
-                "db"_attr = _durable->getName());
+    LOGV2_DEBUG(22546, 1, "Reloading view catalog for database", "db"_attr = _durable->getName());
 
     _viewMap.clear();
     _valid = false;
@@ -142,7 +137,6 @@ Status ViewCatalog::_reload(WithLock,
     } catch (const DBException& ex) {
         auto status = ex.toStatus();
         LOGV2(22547,
-              "Could not load view catalog for database {db}: {error}",
               "Could not load view catalog for database",
               "db"_attr = _durable->getName(),
               "error"_attr = status);
@@ -328,16 +322,15 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
                               std::move(resolvedNamespaces),
                               boost::none);
 
-    // Save this to a variable to avoid reading the atomic variable multiple times.
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
     // If the feature compatibility version is not kLatest, and we are validating features as
     // master, ban the use of new agg features introduced in kLatest to prevent them from being
     // persisted in the catalog.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+    ServerGlobalParams::FeatureCompatibility::Version fcv;
     if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-        currentFCV != ServerGlobalParams::FeatureCompatibility::kLatest) {
-        expCtx->maxFeatureCompatibilityVersion = currentFCV;
+        serverGlobalParams.featureCompatibility.isLessThan(
+            ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
+        expCtx->maxFeatureCompatibilityVersion = fcv;
     }
 
     // The pipeline parser needs to know that we're parsing a pipeline for a view definition
@@ -423,11 +416,6 @@ Status ViewCatalog::createView(OperationContext* opCtx,
     if (!NamespaceString::validCollectionName(viewOn.coll()))
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "invalid name for 'viewOn': " << viewOn.coll());
-
-    if (viewName.isSystem())
-        return Status(
-            ErrorCodes::InvalidNamespace,
-            "View name cannot start with 'system.', which is reserved for system namespaces");
 
     auto collator = parseCollator(opCtx, collation);
     if (!collator.isOK())

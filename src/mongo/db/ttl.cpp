@@ -106,7 +106,7 @@ public:
 
         {
             stdx::lock_guard<Client> lk(*tc.get());
-            tc.get()->setSystemOperationKillable(lk);
+            tc.get()->setSystemOperationKillableByStepdown(lk);
         }
 
         while (true) {
@@ -203,6 +203,12 @@ private:
             auto nss = collectionCatalog.lookupNSSByUUID(&opCtx, uuid);
             if (!nss) {
                 ttlCollectionCache.deregisterTTLInfo(ttlInfo);
+                continue;
+            }
+
+            if (nss->isTemporaryReshardingCollection()) {
+                // For resharding, the donor shard primary is responsible for performing the TTL
+                // deletions.
                 continue;
             }
 

@@ -40,6 +40,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog_entry.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_radix_store.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
@@ -1227,7 +1228,8 @@ Status SortedDataBuilderUnique::addKey(const KeyString::Value& keyString) {
 SortedDataInterfaceBase::SortedDataInterfaceBase(OperationContext* opCtx,
                                                  StringData ident,
                                                  const IndexDescriptor* desc)
-    : ::mongo::SortedDataInterface(KeyString::Version::V1, Ordering::make(desc->keyPattern())),
+    : ::mongo::SortedDataInterface(
+          ident, KeyString::Version::kLatestVersion, Ordering::make(desc->keyPattern())),
       // All entries in this ident will have a prefix of ident + \1.
       _prefix(ident.toString().append(1, '\1')),
       // Therefore, the string ident + \2 will be greater than all elements in this ident.
@@ -1239,9 +1241,10 @@ SortedDataInterfaceBase::SortedDataInterfaceBase(OperationContext* opCtx,
       _isPartial(desc->isPartial()) {}
 
 SortedDataInterfaceBase::SortedDataInterfaceBase(const Ordering& ordering, StringData ident)
-    : ::mongo::SortedDataInterface(KeyString::Version::V1, ordering),
+    : ::mongo::SortedDataInterface(ident, KeyString::Version::kLatestVersion, ordering),
       _prefix(ident.toString().append(1, '\1')),
       _identEnd(ident.toString().append(1, '\2')),
+      _desc(nullptr),
       _isPartial(false) {}
 
 SortedDataBuilderInterface* SortedDataInterfaceUnique::getBulkBuilder(OperationContext* opCtx,
@@ -1372,7 +1375,7 @@ Status SortedDataInterfaceUnique::dupKeyCheck(OperationContext* opCtx,
 
 void SortedDataInterfaceUnique::fullValidate(OperationContext* opCtx,
                                              long long* numKeysOut,
-                                             ValidateResults* fullResults) const {
+                                             IndexValidateResults* fullResults) const {
     StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
     long long numKeys = 0;
     auto it = workingCopy->lower_bound(_KSForIdentStart);
@@ -1510,7 +1513,7 @@ Status SortedDataInterfaceStandard::dupKeyCheck(OperationContext* opCtx,
 
 void SortedDataInterfaceStandard::fullValidate(OperationContext* opCtx,
                                                long long* numKeysOut,
-                                               ValidateResults* fullResults) const {
+                                               IndexValidateResults* fullResults) const {
     StringStore* workingCopy(RecoveryUnit::get(opCtx)->getHead());
     long long numKeys = 0;
     auto it = workingCopy->lower_bound(_KSForIdentStart);

@@ -274,8 +274,8 @@ public:
      * {"pipeline": <explainOutput>}. Note that <explainOutput> can be an object (shardsvr) or an
      * array (non_shardsvr).
      */
-    virtual BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                                 ExplainOptions::Verbosity verbosity) = 0;
+    virtual BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                              ExplainOptions::Verbosity verbosity) = 0;
 
     /**
      * Accepts a pipeline and returns a new one which will draw input from the underlying
@@ -422,7 +422,8 @@ public:
      * Sets the expected shard version for the given namespace. Invariants if the caller attempts to
      * change an existing shard version, or if the shard version for this namespace has already been
      * checked by the commands infrastructure. Used by $lookup and $graphLookup to enforce the
-     * constraint that the foreign collection must be unsharded.
+     * constraint that the foreign collection must be unsharded. If the parent operation is
+     * unversioned, this method does nothing.
      */
     virtual void setExpectedShardVersion(OperationContext* opCtx,
                                          const NamespaceString& nss,

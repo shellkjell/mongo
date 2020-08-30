@@ -185,8 +185,11 @@ OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
                            EnqueueDocumentsFn enqueueDocumentsFn,
                            OnShutdownCallbackFn onShutdownCallbackFn,
                            const int batchSize,
-                           StartingPoint startingPoint)
-    : AbstractAsyncComponent(executor, "oplog fetcher"),
+                           StartingPoint startingPoint,
+                           BSONObj filter,
+                           ReadConcernArgs readConcern,
+                           StringData name)
+    : AbstractAsyncComponent(executor, name.toString()),
       _source(source),
       _requiredRBID(requiredRBID),
       _oplogFetcherRestartDecision(std::move(oplogFetcherRestartDecision)),
@@ -199,7 +202,9 @@ OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
       _enqueueDocumentsFn(enqueueDocumentsFn),
       _awaitDataTimeout(calculateAwaitDataTimeout(config)),
       _batchSize(batchSize),
-      _startingPoint(startingPoint) {
+      _startingPoint(startingPoint),
+      _queryFilter(filter),
+      _queryReadConcern(readConcern) {
     invariant(config.isInitialized());
     invariant(!_lastFetched.isNull());
     invariant(onShutdownCallbackFn);
@@ -308,6 +313,12 @@ Milliseconds OplogFetcher::_getRetriedFindMaxTime() const {
 
 void OplogFetcher::_finishCallback(Status status) {
     invariant(isActive());
+    // If the oplog fetcher is shutting down, consolidate return code to CallbackCanceled.
+    if (_isShuttingDown() && status != ErrorCodes::CallbackCanceled) {
+        status = Status(ErrorCodes::CallbackCanceled,
+                        str::stream() << "Got error: \"" << status.toString()
+                                      << "\" while oplog fetcher is shutting down");
+    }
     _onShutdownCallbackFn(status, _requiredRBID);
 
     decltype(_onShutdownCallbackFn) onShutdownCallbackFn;
@@ -471,7 +482,13 @@ BSONObj OplogFetcher::_makeFindQuery(long long findTimeout) const {
     BSONObjBuilder queryBob;
 
     auto lastOpTimeFetched = _getLastOpTimeFetched();
-    queryBob.append("query", BSON("ts" << BSON("$gte" << lastOpTimeFetched.getTimestamp())));
+    BSONObjBuilder filterBob(queryBob.subobjStart("query"));
+    filterBob.append("ts", BSON("$gte" << lastOpTimeFetched.getTimestamp()));
+    // Handle caller-provided filter.
+    if (!_queryFilter.isEmpty()) {
+        filterBob.append("$and", _queryFilter);
+    }
+    filterBob.done();
 
     queryBob.append("$maxTimeMS", findTimeout);
 
@@ -482,12 +499,17 @@ BSONObj OplogFetcher::_makeFindQuery(long long findTimeout) const {
         queryBob.append("term", term);
     }
 
-    // This ensures that the sync source waits for all earlier oplog writes to be visible.
-    // Since Timestamp(0, 0) isn't allowed, Timestamp(0, 1) is the minimal we can use.
-    queryBob.append("readConcern",
-                    BSON("level"
-                         << "local"
-                         << "afterClusterTime" << Timestamp(0, 1)));
+    if (_queryReadConcern.isEmpty()) {
+        // This ensures that the sync source waits for all earlier oplog writes to be visible.
+        // Since Timestamp(0, 0) isn't allowed, Timestamp(0, 1) is the minimal we can use.
+        queryBob.append("readConcern",
+                        BSON("level"
+                             << "local"
+                             << "afterClusterTime" << Timestamp(0, 1)));
+    } else {
+        // Caller-provided read concern.
+        queryBob.appendElements(_queryReadConcern.toBSON());
+    }
 
     return queryBob.obj();
 }

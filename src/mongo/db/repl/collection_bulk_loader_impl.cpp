@@ -251,31 +251,30 @@ Status CollectionBulkLoaderImpl::commit() {
         }
 
         if (_idIndexBlock) {
-            // Gather RecordIds for uninserted duplicate keys to delete.
-            std::set<RecordId> dups;
             // Do not do inside a WriteUnitOfWork (required by dumpInsertsFromBulk).
-            auto status = _idIndexBlock->dumpInsertsFromBulk(_opCtx.get(), &dups);
+            auto status =
+                _idIndexBlock->dumpInsertsFromBulk(_opCtx.get(), [&](const RecordId& rid) {
+                    return writeConflictRetry(
+                        _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this, &rid] {
+                            WriteUnitOfWork wunit(_opCtx.get());
+                            // If we were to delete the document after committing the index build,
+                            // it's possible that the storage engine unindexes a different record
+                            // with the same key, but different RecordId. By deleting the document
+                            // before committing the index build, the index removal code uses
+                            // 'dupsAllowed', which forces the storage engine to only unindex
+                            // records that match the same key and RecordId.
+                            _autoColl->getCollection()->deleteDocument(_opCtx.get(),
+                                                                       kUninitializedStmtId,
+                                                                       rid,
+                                                                       nullptr /** OpDebug **/,
+                                                                       false /* fromMigrate */,
+                                                                       true /* noWarn */);
+                            wunit.commit();
+                            return Status::OK();
+                        });
+                });
             if (!status.isOK()) {
                 return status;
-            }
-
-            // If we were to delete the documents after committing the index build, it's possible
-            // that the storage engine unindexes a different record with the same key, but different
-            // RecordId. By deleting documents before committing the index build, the index removal
-            // code uses 'dupsAllowed', which forces the storage engine to only unindex records that
-            // match the same key and RecordId.
-            for (auto&& it : dups) {
-                writeConflictRetry(
-                    _opCtx.get(), "CollectionBulkLoaderImpl::commit", _nss.ns(), [this, &it] {
-                        WriteUnitOfWork wunit(_opCtx.get());
-                        _autoColl->getCollection()->deleteDocument(_opCtx.get(),
-                                                                   kUninitializedStmtId,
-                                                                   it,
-                                                                   nullptr /** OpDebug **/,
-                                                                   false /* fromMigrate */,
-                                                                   true /* noWarn */);
-                        wunit.commit();
-                    });
             }
 
             status = _idIndexBlock->drainBackgroundWrites(
@@ -365,14 +364,16 @@ Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(const F& task
 Status CollectionBulkLoaderImpl::_addDocumentToIndexBlocks(const BSONObj& doc,
                                                            const RecordId& loc) {
     if (_idIndexBlock) {
-        auto status = _idIndexBlock->insert(_opCtx.get(), doc, loc);
+        auto status =
+            _idIndexBlock->insertSingleDocumentForInitialSyncOrRecovery(_opCtx.get(), doc, loc);
         if (!status.isOK()) {
             return status.withContext("failed to add document to _id index");
         }
     }
 
     if (_secondaryIndexesBlock) {
-        auto status = _secondaryIndexesBlock->insert(_opCtx.get(), doc, loc);
+        auto status = _secondaryIndexesBlock->insertSingleDocumentForInitialSyncOrRecovery(
+            _opCtx.get(), doc, loc);
         if (!status.isOK()) {
             return status.withContext("failed to add document to secondary indexes");
         }

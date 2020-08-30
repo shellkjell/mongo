@@ -1075,11 +1075,13 @@ struct __wt_update {
 
 /* AUTOMATIC FLAG VALUE GENERATION START */
 #define WT_UPDATE_CLEARED_HS 0x01u               /* Update that cleared the history store. */
-#define WT_UPDATE_HS 0x02u                       /* Update has been written to history store. */
-#define WT_UPDATE_OBSOLETE 0x04u                 /* Update that is obsolete. */
-#define WT_UPDATE_PREPARE_RESTORED_FROM_DS 0x08u /* Prepared update restored from data store. */
-#define WT_UPDATE_RESTORED_FROM_DS 0x10u         /* Update restored from data store. */
-#define WT_UPDATE_RESTORED_FROM_HS 0x20u         /* Update restored from history store. */
+#define WT_UPDATE_DS 0x02u                       /* Update has been written to the data store. */
+#define WT_UPDATE_HS 0x04u                       /* Update has been written to history store. */
+#define WT_UPDATE_OBSOLETE 0x08u                 /* Update that is obsolete. */
+#define WT_UPDATE_PREPARE_RESTORED_FROM_DS 0x10u /* Prepared update restored from data store. */
+#define WT_UPDATE_RESTORED_FAST_TRUNCATE 0x20u   /* Fast truncate instantiation */
+#define WT_UPDATE_RESTORED_FROM_DS 0x40u         /* Update restored from data store. */
+#define WT_UPDATE_RESTORED_FROM_HS 0x80u         /* Update restored from history store. */
                                                  /* AUTOMATIC FLAG VALUE GENERATION STOP */
     uint8_t flags;
 
@@ -1296,10 +1298,12 @@ struct __wt_insert_head {
 
 /* WT_FIX_FOREACH walks fixed-length bit-fields on a disk page. */
 #define WT_FIX_FOREACH(btree, dsk, v, i)                                     \
-    for ((i) = 0, (v) = (i) < (dsk)->u.entries ?                             \
+    for ((i) = 0,                                                            \
+        (v) = (i) < (dsk)->u.entries ?                                       \
            __bit_getv(WT_PAGE_HEADER_BYTE(btree, dsk), 0, (btree)->bitcnt) : \
            0;                                                                \
-         (i) < (dsk)->u.entries; ++(i), (v) = (i) < (dsk)->u.entries ?       \
+         (i) < (dsk)->u.entries; ++(i),                                      \
+        (v) = (i) < (dsk)->u.entries ?                                       \
            __bit_getv(WT_PAGE_HEADER_BYTE(btree, dsk), i, (btree)->bitcnt) : \
            0)
 

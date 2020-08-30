@@ -47,7 +47,8 @@ public:
     ReplicationCoordinatorNoOp(ReplicationCoordinatorNoOp&) = delete;
     ReplicationCoordinatorNoOp& operator=(ReplicationCoordinatorNoOp&) = delete;
 
-    void startup(OperationContext* opCtx) final;
+    void startup(OperationContext* opCtx,
+                 LastStorageEngineShutdownState lastStorageEngineShutdownState) final;
 
     void enterTerminalShutdown() final;
 
@@ -160,8 +161,6 @@ public:
 
     void signalDrainComplete(OperationContext*, long long) final;
 
-    Status waitForDrainFinish(Milliseconds) final;
-
     void signalUpstreamUpdater() final;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const final;
@@ -240,8 +239,6 @@ public:
     Status updateTerm(OperationContext*, long long) final;
 
     OpTime getCurrentCommittedSnapshotOpTime() const final;
-
-    OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const final;
 
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) final;
 

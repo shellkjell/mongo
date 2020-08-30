@@ -49,9 +49,6 @@
 namespace mongo {
 namespace {
 
-// Used to generate sequence numbers to assign to each newly created RoutingTableHistory
-AtomicWord<unsigned> nextCMSequenceNumber(0);
-
 bool allElementsAreOfType(BSONType type, const BSONObj& obj) {
     for (auto&& elem : obj) {
         if (elem.type() != type) {
@@ -309,8 +306,7 @@ RoutingTableHistory::RoutingTableHistory(NamespaceString nss,
                                          std::unique_ptr<CollatorInterface> defaultCollator,
                                          bool unique,
                                          ChunkMap chunkMap)
-    : _sequenceNumber(nextCMSequenceNumber.addAndFetch(1)),
-      _nss(std::move(nss)),
+    : _nss(std::move(nss)),
       _uuid(uuid),
       _shardKeyPattern(shardKeyPattern),
       _defaultCollator(std::move(defaultCollator)),
@@ -719,6 +715,12 @@ std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeNew(
 
 std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
     const std::vector<ChunkType>& changedChunks) {
+
+    // It's possible for there to be one chunk in changedChunks without the routing table having
+    // changed. We skip copying the ChunkMap when this happens.
+    if (changedChunks.size() == 1 && changedChunks[0].getVersion() == getVersion()) {
+        return shared_from_this();
+    }
 
     auto changedChunkInfos = flatten(changedChunks);
     auto chunkMap = _chunkMap.createMerged(changedChunkInfos);

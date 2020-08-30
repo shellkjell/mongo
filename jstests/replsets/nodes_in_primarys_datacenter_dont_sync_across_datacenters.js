@@ -5,7 +5,7 @@
  * that eventually S1 will decide to sync from P, because it is in the same datacenter as P and thus
  * has a lower ping time.
  *
- * @tags: [requires_fcv_46]
+ * @tags: [requires_fcv_47]
  */
 
 (function() {
@@ -80,7 +80,7 @@ const advancedTimestamp =
         .operationTime;
 jsTestLog(
     `Waiting for 'testNode' to receive heartbeats. The primary should have advanced its optime to ${
-        advancedTimestamp}`);
+        tojson(advancedTimestamp)}`);
 assert.soon(() => {
     const replSetGetStatus = assert.commandWorked(testNode.adminCommand({replSetGetStatus: 1}));
 

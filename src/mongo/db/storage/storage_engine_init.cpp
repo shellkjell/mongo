@@ -45,7 +45,6 @@
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -60,9 +59,8 @@ namespace {
 void createLockFile(ServiceContext* service);
 }  // namespace
 
-extern bool _supportsDocLocking;
-
-void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFlags initFlags) {
+LastStorageEngineShutdownState initializeStorageEngine(ServiceContext* service,
+                                                       const StorageEngineInitFlags initFlags) {
     // This should be set once.
     invariant(!service->getStorageEngine());
 
@@ -173,13 +171,26 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 
     guard.dismiss();
 
-    _supportsDocLocking = service->getStorageEngine()->supportsDocLocking();
+    if (serverGlobalParams.enableMajorityReadConcern) {
+        uassert(4939200,
+                str::stream() << "Cannot initialize " << storageGlobalParams.engine
+                              << " with 'enableMajorityReadConcern=true' "
+                                 "as it does not support read concern majority",
+                service->getStorageEngine()->supportsReadConcernMajority());
+    }
+
+    if (lockFile && lockFile->createdByUncleanShutdown()) {
+        return LastStorageEngineShutdownState::kUnclean;
+    } else {
+        return LastStorageEngineShutdownState::kClean;
+    }
 }
 
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service) {
     auto storageEngine = service->getStorageEngine();
     invariant(storageEngine);
-    StorageControl::stopStorageControls(service);
+    StorageControl::stopStorageControls(
+        service, {ErrorCodes::ShutdownInProgress, "The storage catalog is being closed."});
     storageEngine->cleanShutdown();
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
@@ -216,7 +227,6 @@ void createLockFile(ServiceContext* service) {
         LOGV2_WARNING(22271,
                       "Detected unclean shutdown - Lock file is not empty",
                       "lockFile"_attr = lockFile->getFilespec());
-        startingAfterUncleanShutdown(service) = true;
     }
 }
 

@@ -29,7 +29,10 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
+
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
 
 namespace mongo {
@@ -39,12 +42,17 @@ namespace {
 template <class ActualService>
 class TestService : public ReplicaSetAwareService<ActualService> {
 public:
+    int numCallsOnStartup{0};
     int numCallsOnStepUpBegin{0};
     int numCallsOnStepUpComplete{0};
     int numCallsOnStepDown{0};
     int numCallsOnBecomeArbiter{0};
 
 protected:
+    void onStartup(OperationContext* opCtx) override {
+        numCallsOnStartup++;
+    }
+
     void onStepUpBegin(OperationContext* opCtx, long long term) override {
         numCallsOnStepUpBegin++;
     }
@@ -120,6 +128,11 @@ private:
         return true;
     }
 
+    void onStartup(OperationContext* opCtx) final {
+        ASSERT_EQ(numCallsOnStartup, ServiceB::get(getServiceContext())->numCallsOnStartup - 1);
+        TestService::onStartup(opCtx);
+    }
+
     void onStepUpBegin(OperationContext* opCtx, long long term) final {
         ASSERT_EQ(numCallsOnStepUpBegin,
                   ServiceB::get(getServiceContext())->numCallsOnStepUpBegin - 1);
@@ -157,50 +170,72 @@ ServiceContext* ServiceC::getServiceContext() {
 }
 
 
-using ReplicaSetAwareServiceTest = ServiceContextTest;
+class ReplicaSetAwareServiceTest : public ServiceContextTest {
+public:
+    void setUp() override {
+        ServiceContextTest::setUp();
+
+        auto serviceContext = getServiceContext();
+        auto replCoord = std::make_unique<repl::ReplicationCoordinatorMock>(serviceContext);
+        replCoord->setMyLastAppliedOpTimeAndWallTime(
+            repl::OpTimeAndWallTime(repl::OpTime(Timestamp(1, 1), _term), Date_t()));
+        repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
+    }
+
+protected:
+    long long _term = 1;
+};
 
 
 TEST_F(ReplicaSetAwareServiceTest, ReplicaSetAwareService) {
     auto sc = getGlobalServiceContext();
-    auto opCtx = makeOperationContext().get();
+    auto opCtxHolder = makeOperationContext();
+    auto opCtx = opCtxHolder.get();
 
     auto a = ServiceA::get(sc);
     auto b = ServiceB::get(sc);
     auto c = ServiceC::get(sc);
 
+    ASSERT_EQ(0, a->numCallsOnStartup);
     ASSERT_EQ(0, a->numCallsOnStepUpBegin);
     ASSERT_EQ(0, a->numCallsOnStepUpComplete);
     ASSERT_EQ(0, a->numCallsOnStepDown);
     ASSERT_EQ(0, a->numCallsOnBecomeArbiter);
 
+    ASSERT_EQ(0, b->numCallsOnStartup);
     ASSERT_EQ(0, b->numCallsOnStepUpBegin);
     ASSERT_EQ(0, b->numCallsOnStepUpComplete);
     ASSERT_EQ(0, b->numCallsOnStepDown);
     ASSERT_EQ(0, b->numCallsOnBecomeArbiter);
 
+    ASSERT_EQ(0, c->numCallsOnStartup);
     ASSERT_EQ(0, c->numCallsOnStepUpBegin);
     ASSERT_EQ(0, c->numCallsOnStepUpComplete);
     ASSERT_EQ(0, c->numCallsOnStepDown);
     ASSERT_EQ(0, c->numCallsOnBecomeArbiter);
 
-    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, 0);
-    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, 0);
-    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, 0);
-    ReplicaSetAwareServiceRegistry::get(sc).onStepUpComplete(opCtx, 0);
-    ReplicaSetAwareServiceRegistry::get(sc).onStepUpComplete(opCtx, 0);
+    ReplicaSetAwareServiceRegistry::get(sc).onStartup(opCtx);
+    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, _term);
+    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, _term);
+    ReplicaSetAwareServiceRegistry::get(sc).onStepUpBegin(opCtx, _term);
+    ReplicaSetAwareServiceRegistry::get(sc).onStepUpComplete(opCtx, _term);
+    ReplicaSetAwareServiceRegistry::get(sc).onStepUpComplete(opCtx, _term);
     ReplicaSetAwareServiceRegistry::get(sc).onStepDown();
     ReplicaSetAwareServiceRegistry::get(sc).onBecomeArbiter();
 
+    ASSERT_EQ(0, a->numCallsOnStartup);
     ASSERT_EQ(0, a->numCallsOnStepUpBegin);
     ASSERT_EQ(0, a->numCallsOnStepUpComplete);
     ASSERT_EQ(0, a->numCallsOnStepDown);
     ASSERT_EQ(0, a->numCallsOnBecomeArbiter);
 
+    ASSERT_EQ(1, b->numCallsOnStartup);
     ASSERT_EQ(3, b->numCallsOnStepUpBegin);
     ASSERT_EQ(2, b->numCallsOnStepUpComplete);
     ASSERT_EQ(1, b->numCallsOnStepDown);
     ASSERT_EQ(1, b->numCallsOnBecomeArbiter);
 
+    ASSERT_EQ(1, c->numCallsOnStartup);
     ASSERT_EQ(3, c->numCallsOnStepUpBegin);
     ASSERT_EQ(2, c->numCallsOnStepUpComplete);
     ASSERT_EQ(1, c->numCallsOnStepDown);

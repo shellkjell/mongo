@@ -213,8 +213,8 @@ executor::RemoteCommandResponse initWireVersion(
 
     conn->getCompressorManager().clientBegin(&bob);
 
-    if (WireSpec::instance().isInternalClient) {
-        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
 
     Date_t start{Date_t::now()};
@@ -340,8 +340,9 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
         }
     }
 
+    auto wireSpec = WireSpec::instance().get();
     auto validateStatus =
-        rpc::validateWireVersion(WireSpec::instance().outgoing, swProtocolSet.getValue().version);
+        rpc::validateWireVersion(wireSpec->outgoing, swProtocolSet.getValue().version);
     if (!validateStatus.isOK()) {
         LOGV2_WARNING(20126,
                       "Remote host has incompatible wire version: {error}",
@@ -353,8 +354,8 @@ Status DBClientConnection::connect(const HostAndPort& serverAddress, StringData 
 
     _setServerRPCProtocols(swProtocolSet.getValue().protocolSet);
 
-    auto negotiatedProtocol = rpc::negotiate(
-        getServerRPCProtocols(), rpc::computeProtocolSet(WireSpec::instance().outgoing));
+    auto negotiatedProtocol =
+        rpc::negotiate(getServerRPCProtocols(), rpc::computeProtocolSet(wireSpec->outgoing));
 
     if (!negotiatedProtocol.isOK()) {
         return negotiatedProtocol.getStatus();
@@ -677,8 +678,10 @@ unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBa
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,
                                        MongoURI uri,
-                                       const HandshakeValidationHook& hook)
-    : autoReconnect(_autoReconnect),
+                                       const HandshakeValidationHook& hook,
+                                       const ClientAPIVersionParameters* apiParameters)
+    : DBClientBase(apiParameters),
+      autoReconnect(_autoReconnect),
       _autoReconnectBackoff(Seconds(1), Seconds(2)),
       _hook(hook),
       _uri(std::move(uri)) {

@@ -31,7 +31,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/cst/compound_key.h"
 #include "mongo/db/cst/key_fieldname.h"
 #include "mongo/db/cst/key_value.h"
 #include "mongo/platform/decimal128.h"
@@ -49,6 +49,8 @@
 namespace mongo {
 
 using UserFieldname = std::string;
+// These all indicate simple inclusion projection and are used as leaves in CompoundInclusion.
+using NonZeroKey = stdx::variant<int, long long, double, Decimal128>;
 // These are the non-compound types from bsonspec.org.
 using UserDouble = double;
 using UserString = std::string;
@@ -69,6 +71,11 @@ using UserLong = long long;
 using UserDecimal = Decimal128;
 struct UserMinKey {};
 struct UserMaxKey {};
+
+struct UserFieldPath {
+    std::string rawStr;
+    bool isVariable;
+};
 
 struct CNode {
     static auto noopLeaf() {
@@ -148,6 +155,17 @@ struct CNode {
         return stdx::get<KeyFieldname>(objectChildren().begin()->first);
     }
 
+    /*
+     * Returns whether the payload indicates inclusion through a key. Note that this does not return
+     * true for ObjectChildren payloads indicating a computed projection.
+     */
+    auto isInclusionKeyValue() const {
+        return stdx::holds_alternative<NonZeroKey>(payload) ||
+            stdx::holds_alternative<CompoundInclusionKey>(payload) ||
+            (stdx::holds_alternative<KeyValue>(payload) &&
+             stdx::get<KeyValue>(payload) == KeyValue::trueKey);
+    }
+
 private:
     std::string toStringHelper(int numTabs) const;
 
@@ -157,9 +175,14 @@ public:
     using ObjectChildren = std::vector<std::pair<Fieldname, CNode>>;
     stdx::variant<ArrayChildren,
                   ObjectChildren,
+                  CompoundInclusionKey,
+                  CompoundExclusionKey,
+                  CompoundInconsistentKey,
                   KeyValue,
+                  NonZeroKey,
                   UserDouble,
                   UserString,
+                  UserFieldPath,
                   UserBinary,
                   UserUndefined,
                   UserObjectId,
@@ -178,6 +201,14 @@ public:
                   UserMinKey,
                   UserMaxKey>
         payload;
+
+    /*
+     * Returns whether this fieldname is the key fieldname representing the _id syntax.
+     */
+    static auto fieldnameIsId(const CNode::Fieldname& name) {
+        return stdx::holds_alternative<KeyFieldname>(name) &&
+            stdx::get<KeyFieldname>(name) == KeyFieldname::id;
+    }
 };
 
 }  // namespace mongo

@@ -78,105 +78,6 @@ namespace mongo {
 namespace repl {
 namespace {
 
-/**
- * Creates an OplogEntry with given parameters and preset defaults for this test suite.
- */
-OplogEntry makeOplogEntry(OpTypeEnum opType,
-                          NamespaceString nss,
-                          OptionalCollectionUUID uuid,
-                          BSONObj o,
-                          boost::optional<BSONObj> o2) {
-    return OplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
-                      boost::none,                 // hash
-                      opType,                      // opType
-                      nss,                         // namespace
-                      uuid,                        // uuid
-                      boost::none,                 // fromMigrate
-                      OplogEntry::kOplogVersion,   // version
-                      o,                           // o
-                      o2,                          // o2
-                      {},                          // sessionInfo
-                      boost::none,                 // upsert
-                      Date_t(),                    // wall clock time
-                      boost::none,                 // statement id
-                      boost::none,   // optime of previous write within same transaction
-                      boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
-}
-
-OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
-    return makeOplogEntry(opType, nss, uuid, BSON("_id" << 0), boost::none);
-}
-/**
- * Creates collection options suitable for oplog.
- */
-CollectionOptions createOplogCollectionOptions() {
-    CollectionOptions options;
-    options.capped = true;
-    options.cappedSize = 64 * 1024 * 1024LL;
-    options.autoIndexId = CollectionOptions::NO;
-    return options;
-}
-
-/*
- * Creates collection options for recording pre-images for testing deletes
- */
-CollectionOptions createRecordPreImageCollectionOptions() {
-    CollectionOptions options;
-    options.recordPreImages = true;
-    return options;
-}
-
-/**
- * Create test collection.
- * Returns collection.
- */
-void createCollection(OperationContext* opCtx,
-                      const NamespaceString& nss,
-                      const CollectionOptions& options) {
-    writeConflictRetry(opCtx, "createCollection", nss.ns(), [&] {
-        Lock::DBLock dblk(opCtx, nss.db(), MODE_IX);
-        Lock::CollectionLock collLk(opCtx, nss, MODE_X);
-        OldClientContext ctx(opCtx, nss.ns());
-        auto db = ctx.db();
-        ASSERT_TRUE(db);
-        mongo::WriteUnitOfWork wuow(opCtx);
-        auto coll = db->createCollection(opCtx, nss, options);
-        ASSERT_TRUE(coll);
-        wuow.commit();
-    });
-}
-
-
-/**
- * Create test collection with UUID.
- */
-auto createCollectionWithUuid(OperationContext* opCtx, const NamespaceString& nss) {
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    createCollection(opCtx, nss, options);
-    return options.uuid.get();
-}
-
-/**
- * Create test database.
- */
-void createDatabase(OperationContext* opCtx, StringData dbName) {
-    Lock::GlobalWrite globalLock(opCtx);
-    bool justCreated;
-    auto databaseHolder = DatabaseHolder::get(opCtx);
-    auto db = databaseHolder->openDb(opCtx, dbName, &justCreated);
-    ASSERT_TRUE(db);
-    ASSERT_TRUE(justCreated);
-}
-
-/**
- * Returns true if collection exists.
- */
-bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
-}
-
 auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
     BSONElement tsArray;
     Status status =
@@ -631,9 +532,8 @@ protected:
                 } else if (nss == _nss1 || nss == _nss2 ||
                            nss == NamespaceString::kSessionTransactionsTableNamespace) {
                     // Storing the inserted documents in a sorted data structure to make checking
-                    // for valid results easier. On a document level locking storage engine the
-                    // inserts will be performed by different threads and there's no guarantee of
-                    // the order.
+                    // for valid results easier. The inserts will be performed by different threads
+                    // and there's no guarantee of the order.
                     _insertedDocs[nss].insert(docs.begin(), docs.end());
                 } else
                     FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
@@ -966,6 +866,17 @@ protected:
     void setUp() override {
         MultiOplogEntryOplogApplierImplTest::setUp();
 
+        // Replaying prepared transactions requires 'enableMajorityReadConcern' to be set to true.
+        // This test uses ephemeralForTest under the hood and is ran in standalone mode. Given that,
+        // to satisfy the tests requirements, we forcefully set 'enableMajorityReadConcern' to true
+        // for these tests.
+        //
+        // Switching the storage engine to use WiredTiger comes with its own complications.
+        // 1. Transaction prepare is not supported with logged tables in debug builds.
+        // 2. Transactions cannot be assigned a log record if WT_CONN_LOG_DEBUG mode is not enabled.
+        _stashedEnableMajorityReadConcern =
+            std::exchange(serverGlobalParams.enableMajorityReadConcern, true);
+
         _prepareWithPrevOp = makeCommandOplogEntryWithSessionInfoAndStmtId(
             {Timestamp(Seconds(1), 3), 1LL},
             _nss1,
@@ -1024,12 +935,19 @@ protected:
                                                           _singlePrepareApplyOp->getOpTime());
     }
 
+    void tearDown() override {
+        MultiOplogEntryOplogApplierImplTest::tearDown();
+
+        serverGlobalParams.enableMajorityReadConcern = _stashedEnableMajorityReadConcern;
+    }
+
 protected:
     boost::optional<OplogEntry> _commitPrepareWithPrevOp, _abortPrepareWithPrevOp,
         _singlePrepareApplyOp, _prepareWithPrevOp, _commitSinglePrepareApplyOp,
         _abortSinglePrepareApplyOp;
 
 private:
+    bool _stashedEnableMajorityReadConcern;
     Mutex _insertMutex = MONGO_MAKE_LATCH("MultiOplogEntryPreparedTransactionTest::_insertMutex");
 };
 
@@ -2525,7 +2443,8 @@ public:
                                 boost::none,    // statement id
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
-                                boost::none);   // post-image optime
+                                boost::none,    // post-image optime
+                                boost::none);   // ShardId of resharding recipient
     }
 
     /**
@@ -2553,7 +2472,8 @@ public:
                                 boost::none,    // statement id
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
-                                boost::none);   // post-image optime
+                                boost::none,    // post-image optime
+                                boost::none);   // ShardId of resharding recipient
     }
 
     void checkTxnTable(const OperationSessionInfo& sessionInfo,

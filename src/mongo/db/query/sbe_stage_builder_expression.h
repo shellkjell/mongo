@@ -32,6 +32,7 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression.h"
 
 namespace mongo::stage_builder {
@@ -46,14 +47,22 @@ namespace mongo::stage_builder {
  * slots to forward.
  *
  * The 'relevantSlots' is an input/output parameter. Execution of this function may add additional
- * relevant slots to thie list.
+ * relevant slots to the list.
  */
 std::tuple<sbe::value::SlotId, std::unique_ptr<sbe::EExpression>, std::unique_ptr<sbe::PlanStage>>
-generateExpression(Expression* expr,
+generateExpression(OperationContext* opCtx,
+                   Expression* expr,
                    std::unique_ptr<sbe::PlanStage> stage,
                    sbe::value::SlotIdGenerator* slotIdGenerator,
                    sbe::value::FrameIdGenerator* frameIdGenerator,
                    sbe::value::SlotId inputVar,
+                   sbe::RuntimeEnvironment* env,
                    sbe::value::SlotVector* relevantSlots = nullptr);
 
+/**
+ * Generate an EExpression that converts a value (contained in a variable bound to 'branchRef') that
+ * can be of any type to a Boolean value based on MQL's definition of truth for the branch of any
+ * logical expression.
+ */
+std::unique_ptr<sbe::EExpression> generateExpressionForLogicBranch(sbe::EVariable branchRef);
 }  // namespace mongo::stage_builder

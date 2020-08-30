@@ -1,6 +1,6 @@
 /**
- * Verifies that a change stream which is resumed on a downgraded last-stable binary does not crash
- * the server, even when reading oplog entries which the last-stable binary may not understand.
+ * Verifies that a change stream which is resumed on a downgraded binary does not crash
+ * the server, even when reading oplog entries which the downgraded binary may not understand.
  *
  * @tags: [uses_change_streams, requires_replication]
  */
@@ -32,6 +32,9 @@ assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 st.ensurePrimaryShard(dbName, st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({shardCollection: shardedColl.getFullName(), key: {sk: 1}}));
 
+const largeStr = '*'.repeat(512);
+const giantStr = '*'.repeat(1024);
+
 //  Define a set of standard write tests. These tests will be run for every new version and should
 //  not be modified. Each test case should have a function with field name 'generateOpLogEntry'
 //  which takes a collection object as input.
@@ -42,7 +45,12 @@ const standardTestCases = [
         generateOpLogEntry: function(coll) {
             assert.commandWorked(coll.runCommand({
                 insert: coll.getName(),
-                documents: [{sk: 1}, {sk: 2}, {sk: -1}, {sk: -2}],
+                documents: [
+                    {sk: 1},
+                    {sk: 2, giantStr: giantStr},
+                    {sk: -1},
+                    {sk: -2, giantStr: giantStr, obj: {a: 1, b: 2}}
+                ],
                 ordered: false
             }));
         }
@@ -71,15 +79,36 @@ const standardTestCases = [
                 updates: [{q: {sk: 1}, u: {sk: 1, a: 2}}, {q: {sk: -1}, u: {sk: -1, a: 2}}]
             }));
         }
-
     },
-    // Pipeline style update.
+    // Pipeline style update (delta type diff).
     {
-        testName: "PipelineStyleUpdate",
+        testName: "PipelineStyleUpdateDeltaOplog",
         generateOpLogEntry: function(coll) {
             assert.commandWorked(coll.runCommand({
                 update: shardedColl.getName(),
-                updates: [{q: {sk: 2}, u: [{$set: {a: 3}}]}, {q: {sk: -2}, u: [{$set: {a: 3}}]}]
+                updates: [
+                    {q: {sk: 2}, u: [{$set: {a: 3}}]},
+                    {q: {sk: -2}, u: [{$set: {a: 3}}]},
+                    {
+                        q: {sk: 2},
+                        u: [
+                            {$replaceRoot: {newRoot: {sk: 2}}},
+                            {$addFields: {"a": "updated", "b": 2}},
+                            {$project: {"sk": true, "a": true}},
+                        ]
+                    }
+                ]
+            }));
+        }
+    },
+    // Pipeline style update (replacement style diff).
+    {
+        testName: "PipelineStyleUpdateReplacementOplog",
+        generateOpLogEntry: function(coll) {
+            assert.commandWorked(coll.runCommand({
+                update: shardedColl.getName(),
+                updates:
+                    [{q: {sk: -2}, u: [{$replaceRoot: {newRoot: {sk: -2, largeStr: largeStr}}}]}]
             }));
         }
     },
@@ -170,8 +199,8 @@ function writeOplogEntriesAndCreateResumePointsOnLatestVersion() {
     let testStartTime = createSentinelEntryAndGetTimeStamp(testNum);
     const outputChangeStreams = [];
     for (let testCase of testCases) {
-        jsTestLog(
-            `Opening a change stream for '${testCase.testName}' at startTime: ${testStartTime}`);
+        jsTestLog(`Opening a change stream for '${testCase.testName}' at startTime: ${
+            tojson(testStartTime)}`);
 
         // Capture the 'resumeToken' when the sentinel entry is found. We use the token to resume
         // the stream rather than the 'testStartTime' because resuming from a token adds more stages
@@ -220,7 +249,7 @@ function writeOplogEntriesAndCreateResumePointsOnLatestVersion() {
  * should be an array and each entry should have fields 'watch', 'resumeToken' and
  * 'endSentinelEntry'.
  */
-function resumeStreamsOnLastStableVersion(changeStreams) {
+function resumeStreamsOnDowngradedVersion(changeStreams) {
     for (let changeStream of changeStreams) {
         jsTestLog("Validating change stream for " + tojson(changeStream));
         const csCursor = changeStream.watch({resumeAfter: changeStream.resumeToken});
@@ -252,17 +281,30 @@ function resumeStreamsOnLastStableVersion(changeStreams) {
 // cluster has been downgraded.
 const changeStreamsToBeValidated = writeOplogEntriesAndCreateResumePointsOnLatestVersion();
 
-// Downgrade the entire cluster to 'last-stable' binVersion.
-assert.commandWorked(
-    st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-st.upgradeCluster("last-stable");
+function runTests(downgradeVersion) {
+    jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
+    const downgradeFCV = downgradeVersion === "last-lts" ? lastLTSFCV : lastContinuousFCV;
+    // Downgrade the entire cluster to the 'downgradeVersion' binVersion.
+    assert.commandWorked(
+        st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    st.upgradeCluster(downgradeVersion);
 
-// Refresh our reference to the sharded collection post-downgrade.
-shardedColl = st.s.getDB(dbName)[collName];
+    // Refresh our reference to the sharded collection post-downgrade.
+    shardedColl = st.s.getDB(dbName)[collName];
 
-// Resume all the change streams that were created on latest version and validate that the change
-// stream doesn't crash the server after downgrade.
-resumeStreamsOnLastStableVersion(changeStreamsToBeValidated);
+    // Resume all the change streams that were created on latest version and validate that the
+    // change stream doesn't crash the server after downgrade.
+    resumeStreamsOnDowngradedVersion(changeStreamsToBeValidated);
+}
 
+// Test resuming change streams after downgrading the cluster to 'last-continuous'.
+runTests('last-continuous');
+
+// Upgrade the entire cluster back to the latest version.
+st.upgradeCluster('latest', {waitUntilStable: true});
+assert.commandWorked(st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+
+// Test resuming change streams after downgrading the cluster to 'last-lts'.
+runTests('last-lts');
 st.stop();
 }());

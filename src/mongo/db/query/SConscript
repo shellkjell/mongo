@@ -15,10 +15,25 @@ env.SConscript(
 )
 
 env.Library(
-    target='query_planner',
+    target='canonical_query',
     source=[
         "canonical_query.cpp",
         "canonical_query_encoder.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/matcher/expressions",
+        "collation/collator_factory_interface",
+        "collation/collator_interface",
+        "projection_ast",
+        "sort_pattern",
+    ],
+    LIBDEPS_PRIVATE=[
+    ],
+)
+
+env.Library(
+    target='query_planner',
+    source=[
         "index_tag.cpp",
         "plan_cache.cpp",
         "plan_cache_indexability.cpp",
@@ -47,12 +62,9 @@ env.Library(
         "$BUILD_DIR/mongo/db/index/expression_params",
         "$BUILD_DIR/mongo/db/index/key_generator",
         "$BUILD_DIR/mongo/db/index_names",
-        "$BUILD_DIR/mongo/db/matcher/expressions",
         "$BUILD_DIR/mongo/db/mongohasher",
-        "collation/collator_factory_interface",
-        "collation/collator_interface",
+        'canonical_query',
         "command_request_response",
-        "projection_ast",
         "query_knobs",
     ],
     LIBDEPS_PRIVATE=[
@@ -149,11 +161,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
+        '$BUILD_DIR/mongo/db/query/hint_parser',
         '$BUILD_DIR/mongo/db/repl/optime',
-        "$BUILD_DIR/mongo/idl/idl_parser",
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
-        '$BUILD_DIR/mongo/db/query/hint_parser',
         'query_request',
     ]
 )
@@ -192,9 +204,9 @@ env.Library(
         "query_test_service_context.cpp",
     ],
     LIBDEPS=[
-        "collation/collator_factory_mock",
         "$BUILD_DIR/mongo/db/logical_session_id",
         "$BUILD_DIR/mongo/db/service_context",
+        "collation/collator_factory_mock",
     ],
     LIBDEPS_PRIVATE=[
     ],
@@ -206,8 +218,8 @@ env.Library(
         "query_planner_test_fixture.cpp",
     ],
     LIBDEPS=[
-        "query_planner_test_lib",
         "$BUILD_DIR/mongo/unittest/unittest",
+        "query_planner_test_lib",
     ],
 )
 

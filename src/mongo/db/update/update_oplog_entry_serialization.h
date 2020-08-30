@@ -37,6 +37,9 @@
  * entry, a LogBuilder must be used instead.
  */
 namespace mongo::update_oplog_entry {
+static inline constexpr StringData kDiffObjectFieldName = "diff"_sd;
+
+constexpr size_t kSizeOfDeltaOplogEntryMetadata = 15;
 
 /**
  * Given a diff, produce the contents for the 'o' field of a $v: 2 delta-style oplog entry.
@@ -44,7 +47,7 @@ namespace mongo::update_oplog_entry {
 inline BSONObj makeDeltaOplogEntry(const doc_diff::Diff& diff) {
     BSONObjBuilder builder;
     builder.append("$v", static_cast<int>(UpdateOplogEntryVersion::kDeltaV2));
-    builder.append("diff", diff);
+    builder.append(kDiffObjectFieldName, diff);
     return builder.obj();
 }
 

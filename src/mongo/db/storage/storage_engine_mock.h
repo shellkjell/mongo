@@ -45,9 +45,6 @@ public:
     std::vector<std::string> listDatabases() const final {
         return {};
     }
-    bool supportsDocLocking() const final {
-        return false;
-    }
     bool supportsCappedCollections() const final {
         return true;
     }
@@ -60,7 +57,7 @@ public:
     bool isEphemeral() const final {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx) final {}
+    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final {}
     void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
@@ -94,6 +91,10 @@ public:
         return Status::OK();
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
+        return {};
+    }
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident) final {
         return {};
     }
     void cleanShutdown() final {}
@@ -134,16 +135,19 @@ public:
     }
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
     void setInitialDataTimestamp(Timestamp timestamp) final {}
-    Timestamp getInitialDataTimestamp() {
+    Timestamp getInitialDataTimestamp() const override {
         return Timestamp();
     }
     void setOldestTimestampFromStable() final {}
     void setOldestTimestamp(Timestamp timestamp) final {}
+    Timestamp getOldestTimestamp() const final {
+        return {};
+    };
     void setOldestActiveTransactionTimestampCallback(
         OldestActiveTransactionTimestampCallback callback) final {}
 
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx) final {
+        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
@@ -161,6 +165,9 @@ public:
     std::set<std::string> getDropPendingIdents() const final {
         return {};
     }
+    void addDropPendingIdent(const Timestamp& dropTimestamp,
+                             const NamespaceString& nss,
+                             std::shared_ptr<Ident> ident) final {}
     Status currentFilesCompatible(OperationContext* opCtx) const final {
         return Status::OK();
     }

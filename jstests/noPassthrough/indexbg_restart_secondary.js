@@ -69,11 +69,15 @@ IndexBuildTest.waitForIndexBuildToStart(secondDB, coll.getName(), "y_1");
 
 MongoRunner.stopMongod(second);
 
-replTest.start(
-    second,
-    {setParameter: {"failpoint.hangAfterSettingUpIndexBuildUnlocked": tojson({mode: "alwaysOn"})}},
-    /*restart=*/true,
-    /*wait=*/true);
+replTest.start(second,
+               {
+                   setParameter: {
+                       "failpoint.hangAfterSettingUpIndexBuildUnlocked": tojson({mode: "alwaysOn"}),
+                       "failpoint.hangAfterSettingUpResumableIndexBuild": tojson({mode: "alwaysOn"})
+                   }
+               },
+               /*restart=*/true,
+               /*wait=*/true);
 
 // Make sure secondary comes back.
 try {
@@ -90,7 +94,13 @@ try {
     assert.eq(size, secondDB.getCollection(collectionName).find({}).itcount());
 
     // Verify that only the _id index is ready.
-    checkLog.containsJson(second, 4585201);
+    const supportsCommittedReads =
+        assert.commandWorked(secondDB.serverStatus()).storageEngine.supportsCommittedReads;
+    if (ResumableIndexBuildTest.resumableIndexBuildsEnabled(second) && supportsCommittedReads) {
+        checkLog.containsJson(second, 4841704);
+    } else {
+        checkLog.containsJson(second, 4585201);
+    }
     IndexBuildTest.assertIndexes(secondDB.getCollection(collectionName),
                                  4,
                                  ["_id_"],
@@ -99,6 +109,8 @@ try {
 } finally {
     assert.commandWorked(second.adminCommand(
         {configureFailPoint: 'hangAfterSettingUpIndexBuildUnlocked', mode: 'off'}));
+    assert.commandWorked(second.adminCommand(
+        {configureFailPoint: 'hangAfterSettingUpResumableIndexBuild', mode: 'off'}));
 
     // Let index build complete on primary, which replicates a commitIndexBuild to the secondary.
     IndexBuildTest.resumeIndexBuilds(primaryDB);

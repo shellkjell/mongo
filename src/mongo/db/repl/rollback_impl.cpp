@@ -277,7 +277,7 @@ void RollbackImpl::_killAllUserOperations(OperationContext* opCtx) {
 
     for (ServiceContext::LockedClientsCursor cursor(serviceCtx); Client* client = cursor.next();) {
         stdx::lock_guard<Client> lk(*client);
-        if (client->isFromSystemConnection() && !client->shouldKillSystemOperation(lk)) {
+        if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk)) {
             continue;
         }
 
@@ -343,7 +343,8 @@ void RollbackImpl::_stopAndWaitForIndexBuilds(OperationContext* opCtx) {
     invariant(opCtx);
 
     // Aborts all active, two-phase index builds.
-    IndexBuildsCoordinator::get(opCtx)->stopIndexBuildsForRollback(opCtx);
+    MONGO_COMPILER_VARIABLE_UNUSED auto stoppedIndexBuilds =
+        IndexBuildsCoordinator::get(opCtx)->stopIndexBuildsForRollback(opCtx);
 
     // Get a list of all databases.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();

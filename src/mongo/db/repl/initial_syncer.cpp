@@ -348,7 +348,7 @@ void InitialSyncer::_cancelRemainingWork_inlock() {
         // We actually hold the required lock, but the lock object itself is not passed through.
         _clearRetriableError(WithLock::withoutLock());
         stdx::lock_guard<InitialSyncSharedData> lock(*_sharedData);
-        _sharedData->setInitialSyncStatusIfOK(
+        _sharedData->setStatusIfOK(
             lock, Status{ErrorCodes::CallbackCanceled, "Initial sync attempt canceled"});
     }
     if (_client) {
@@ -629,10 +629,10 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
 
     LOGV2_DEBUG(21168,
                 2,
-                "Resetting feature compatibility version to last-stable. If the sync source is in "
+                "Resetting feature compatibility version to last-lts. If the sync source is in "
                 "latest feature compatibility version, we will find out when we clone the "
                 "server configuration collection (admin.system.version)");
-    serverGlobalParams.featureCompatibility.reset();
+    serverGlobalParams.mutableFeatureCompatibility.reset();
 
     // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());
@@ -1087,8 +1087,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     // Changing the featureCompatibilityVersion during initial sync is unsafe.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    if (version > ServerGlobalParams::FeatureCompatibility::kLastLTS &&
-        version < ServerGlobalParams::FeatureCompatibility::kLatest) {
+    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(version)) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(
             lock,
             Status(ErrorCodes::IncompatibleServerVersion,

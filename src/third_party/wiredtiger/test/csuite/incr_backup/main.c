@@ -48,6 +48,8 @@
 #define URI_FORMAT "table:t%d-%d"
 #define KEY_FORMAT "key-%d-%d"
 
+#define CONN_CONFIG_COMMON "timing_stress_for_test=[backup_rename]"
+
 static int verbose_level = 0;
 static uint64_t seed = 0;
 
@@ -59,7 +61,7 @@ static void usage(void) WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 static bool slow_incremental = false;
 
 static bool do_drop = true;
-static bool do_rename = false;
+static bool do_rename = true;
 
 #define VERBOSE(level, fmt, ...)      \
     do {                              \
@@ -547,7 +549,7 @@ reopen_file(int *fdp, char *buf, size_t buflen, const char *filename, int oflag)
  */
 static void
 incr_backup(WT_CONNECTION *conn, const char *home, const char *backup_home, TABLE_INFO *tinfo,
-  ACTIVE_FILES *master_active)
+  ACTIVE_FILES *current_active)
 {
     ACTIVE_FILES active;
     WT_CURSOR *cursor, *file_cursor;
@@ -560,7 +562,7 @@ incr_backup(WT_CONNECTION *conn, const char *home, const char *backup_home, TABL
     char *filename;
 
     VERBOSE(2, "INCREMENTAL BACKUP: %s\n", backup_home);
-    active_files_print(master_active, "master list before incremental backup");
+    active_files_print(current_active, "current list before incremental backup");
     WT_CLEAR(rbuf);
     WT_CLEAR(wbuf);
     rfd = wfd = -1;
@@ -637,10 +639,10 @@ incr_backup(WT_CONNECTION *conn, const char *home, const char *backup_home, TABL
     VERBOSE(2, " finished incremental backup: %d files, %d range copy, %d file copy\n", nfiles,
       nrange, ncopy);
     active_files_sort(&active);
-    active_files_remove_missing(master_active, &active, backup_home);
+    active_files_remove_missing(current_active, &active, backup_home);
 
-    /* Move the current active list to the master list */
-    active_files_move(master_active, &active);
+    /* Move the active list to the current list. */
+    active_files_move(current_active, &active);
 }
 
 static void
@@ -730,7 +732,7 @@ check_backup(const char *backup_home, const char *backup_check, TABLE_INFO *tinf
       buf, sizeof(buf), "rm -rf %s && cp -r %s %s", backup_check, backup_home, backup_check));
     testutil_check(system(buf));
 
-    testutil_check(wiredtiger_open(backup_check, NULL, NULL, &conn));
+    testutil_check(wiredtiger_open(backup_check, NULL, CONN_CONFIG_COMMON, &conn));
     testutil_check(conn->open_session(conn, NULL, NULL, &session));
 
     for (slot = 0; slot < tinfo->table_count; slot++) {
@@ -818,8 +820,9 @@ main(int argc, char *argv[])
         file_max = 200 + __wt_random(&rnd) % 1000; /* 200K to ~1M */
     else
         file_max = 1000 + __wt_random(&rnd) % 20000; /* 1M to ~20M */
-    testutil_check(__wt_snprintf(conf, sizeof(conf),
-      "create,%s,log=(enabled=true,file_max=%" PRIu32 "K)", backup_verbose, file_max));
+    testutil_check(
+      __wt_snprintf(conf, sizeof(conf), "%s,create,%s,log=(enabled=true,file_max=%" PRIu32 "K)",
+        CONN_CONFIG_COMMON, backup_verbose, file_max));
     VERBOSE(2, "wiredtiger config: %s\n", conf);
     testutil_check(wiredtiger_open(home, NULL, conf, &conn));
     testutil_check(conn->open_session(conn, NULL, NULL, &session));

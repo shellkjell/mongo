@@ -42,8 +42,10 @@
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/db/query/bson_typemask.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/represent_as.h"
 
 namespace pcrecpp {
 class RE;
@@ -56,6 +58,9 @@ namespace mongo {
 namespace KeyString {
 class Value;
 }
+
+class TimeZoneDatabase;
+
 namespace sbe {
 using FrameId = int64_t;
 using SpoolId = int64_t;
@@ -71,7 +76,7 @@ enum class TypeTags : uint8_t {
     // The value does not exist, aka Nothing in the Maybe monad.
     Nothing = 0,
 
-    // Numberical data types.
+    // Numerical data types.
     NumberInt32,
     NumberInt64,
     NumberDouble,
@@ -98,15 +103,17 @@ enum class TypeTags : uint8_t {
     bsonArray,
     bsonString,
     bsonObjectId,
+    bsonBinData,
 
     // KeyString::Value
     ksValue,
 
     // Pointer to a compiled PCRE regular expression object.
     pcreRegex,
-};
 
-std::ostream& operator<<(std::ostream& os, const TypeTags tag);
+    // Pointer to a timezone database object.
+    timeZoneDB,
+};
 
 inline constexpr bool isNumber(TypeTags tag) noexcept {
     return tag == TypeTags::NumberInt32 || tag == TypeTags::NumberInt64 ||
@@ -130,6 +137,23 @@ inline constexpr bool isObjectId(TypeTags tag) noexcept {
     return tag == TypeTags::ObjectId || tag == TypeTags::bsonObjectId;
 }
 
+inline constexpr bool isBinData(TypeTags tag) noexcept {
+    return tag == TypeTags::bsonBinData;
+}
+
+BSONType tagToType(TypeTags tag) noexcept;
+
+/**
+ * This function takes an SBE TypeTag, looks up the corresponding BSONType t, and then returns a
+ * bitmask representation of a set of BSONTypes that contains only BSONType t.
+ *
+ * For details on how sets of BSONTypes are represented as bitmasks, see mongo::getBSONTypeMask().
+ */
+inline uint32_t getBSONTypeMask(value::TypeTags tag) noexcept {
+    BSONType t = value::tagToType(tag);
+    return getBSONTypeMask(t);
+}
+
 /**
  * The runtime value. It is a simple 64 bit integer.
  */
@@ -145,8 +169,15 @@ enum class SortDirection : uint8_t { Descending, Ascending };
  */
 void releaseValue(TypeTags tag, Value val) noexcept;
 std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val);
-void printValue(std::ostream& os, TypeTags tag, Value val);
 std::size_t hashValue(TypeTags tag, Value val) noexcept;
+
+/**
+ * Overloads for writing values and tags to stream.
+ */
+std::ostream& operator<<(std::ostream& os, const TypeTags tag);
+str::stream& operator<<(str::stream& str, const TypeTags tag);
+std::ostream& operator<<(std::ostream& os, const std::pair<TypeTags, Value>& value);
+str::stream& operator<<(str::stream& str, const std::pair<TypeTags, Value>& value);
 
 /**
  * Three ways value comparison (aka spaceship operator).
@@ -414,6 +445,12 @@ T readFromMemory(const unsigned char* memory) noexcept {
     return val;
 }
 
+inline Decimal128 readDecimal128FromMemory(const ConstDataView& view) {
+    uint64_t low = view.read<LittleEndian<long long>>();
+    uint64_t high = view.read<LittleEndian<long long>>(sizeof(long long));
+    return Decimal128{Decimal128::Value{low, high}};
+}
+
 template <typename T>
 size_t writeToMemory(unsigned char* memory, const T val) noexcept {
     memcpy(memory, &val, sizeof(T));
@@ -424,6 +461,16 @@ size_t writeToMemory(unsigned char* memory, const T val) noexcept {
 template <typename T>
 Value bitcastFrom(const T in) noexcept {
     static_assert(sizeof(Value) >= sizeof(T));
+
+    // Callers must not try to store a pointer to a Decimal128 object in an sbe::value::Value. Any
+    // Value with the NumberDecimal TypeTag actually stores a pointer to a NumberDecimal as it would
+    // be represented in a BSONElement: a pair of network-ordered (little-endian) uint64_t values.
+    // These bytes are _not_ guaranteed to be the same as the bytes in a Decimal128_t object.
+    //
+    // To get a NumberDecimal value, either call makeCopyDecimal() or store the value in BSON and
+    // use sbe::bson::convertFrom().
+    static_assert(!std::is_same_v<Decimal128, T>);
+    static_assert(!std::is_same_v<Decimal128*, T>);
 
     // Casting from pointer to integer value is OK.
     if constexpr (std::is_pointer_v<T>) {
@@ -442,9 +489,7 @@ T bitcastTo(const Value in) noexcept {
         return reinterpret_cast<T>(in);
     } else if constexpr (std::is_same_v<Decimal128, T>) {
         static_assert(sizeof(Value) == sizeof(T*));
-        T val;
-        memcpy(&val, getRawPointerView(in), sizeof(T));
-        return val;
+        return readDecimal128FromMemory(ConstDataView{getRawPointerView(in)});
     } else {
         static_assert(sizeof(Value) >= sizeof(T));
         T val;
@@ -464,6 +509,22 @@ inline std::string_view getStringView(TypeTags tag, Value& val) noexcept {
                                 ConstDataView(bsonstr).read<LittleEndian<uint32_t>>() - 1);
     }
     MONGO_UNREACHABLE;
+}
+
+inline size_t getBSONBinDataSize(TypeTags tag, Value val) {
+    invariant(tag == TypeTags::bsonBinData);
+    return static_cast<size_t>(
+        ConstDataView(getRawPointerView(val)).read<LittleEndian<uint32_t>>());
+}
+
+inline BinDataType getBSONBinDataSubtype(TypeTags tag, Value val) {
+    invariant(tag == TypeTags::bsonBinData);
+    return static_cast<BinDataType>((getRawPointerView(val) + sizeof(uint32_t))[0]);
+}
+
+inline uint8_t* getBSONBinData(TypeTags tag, Value val) {
+    invariant(tag == TypeTags::bsonBinData);
+    return reinterpret_cast<uint8_t*>(getRawPointerView(val) + sizeof(uint32_t) + 1);
 }
 
 inline std::pair<TypeTags, Value> makeSmallString(std::string_view input) {
@@ -546,21 +607,24 @@ inline ObjectIdType* getObjectIdView(Value val) noexcept {
     return reinterpret_cast<ObjectIdType*>(val);
 }
 
-inline Decimal128* getDecimalView(Value val) noexcept {
-    return reinterpret_cast<Decimal128*>(val);
-}
-
 inline std::pair<TypeTags, Value> makeCopyDecimal(const Decimal128& inD) {
-    auto o = new Decimal128(inD);
-    return {TypeTags::NumberDecimal, reinterpret_cast<Value>(o)};
+    auto valueBuffer = new char[2 * sizeof(long long)];
+    DataView decimalView(valueBuffer);
+    decimalView.write<LittleEndian<long long>>(inD.getValue().low64, 0);
+    decimalView.write<LittleEndian<long long>>(inD.getValue().high64, sizeof(long long));
+    return {TypeTags::NumberDecimal, reinterpret_cast<Value>(valueBuffer)};
 }
 
 inline KeyString::Value* getKeyStringView(Value val) noexcept {
     return reinterpret_cast<KeyString::Value*>(val);
 }
 
-inline pcrecpp::RE* getPrceRegexView(Value val) noexcept {
+inline pcrecpp::RE* getPcreRegexView(Value val) noexcept {
     return reinterpret_cast<pcrecpp::RE*>(val);
+}
+
+inline TimeZoneDatabase* getTimeZoneDBView(Value val) noexcept {
+    return reinterpret_cast<TimeZoneDatabase*>(val);
 }
 
 std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey);
@@ -617,10 +681,17 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             memcpy(dst, bson, size);
             return {TypeTags::bsonArray, bitcastFrom(dst)};
         }
+        case TypeTags::bsonBinData: {
+            auto binData = getRawPointerView(val);
+            auto size = getBSONBinDataSize(tag, val);
+            auto dst = new uint8_t[size + sizeof(uint32_t) + 1];
+            memcpy(dst, binData, size + sizeof(uint32_t) + 1);
+            return {TypeTags::bsonBinData, bitcastFrom(dst)};
+        }
         case TypeTags::ksValue:
             return makeCopyKeyString(*getKeyStringView(val));
         case TypeTags::pcreRegex:
-            return makeCopyPcreRegex(*getPrceRegexView(val));
+            return makeCopyPcreRegex(*getPcreRegexView(val));
         default:
             break;
     }
@@ -659,6 +730,44 @@ inline T numericCast(TypeTags tag, Value val) noexcept {
             MONGO_UNREACHABLE;
         default:
             MONGO_UNREACHABLE;
+    }
+}
+
+/**
+ * Performs a lossless numeric conversion from a value to a destination type denoted by the target
+ * TypeTag. In the case that a conversion is lossy, we return Nothing.
+ */
+template <typename T>
+inline std::tuple<bool, value::TypeTags, value::Value> numericConvLossless(
+    T value, value::TypeTags targetTag) {
+    switch (targetTag) {
+        case value::TypeTags::NumberInt32: {
+            if (auto result = representAs<int32_t>(value); result) {
+                return {false, value::TypeTags::NumberInt32, value::bitcastFrom(*result)};
+            }
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        case value::TypeTags::NumberInt64: {
+            if (auto result = representAs<int64_t>(value); result) {
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(*result)};
+            }
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        case value::TypeTags::NumberDouble: {
+            if (auto result = representAs<double>(value); result) {
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(*result)};
+            }
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        case value::TypeTags::NumberDecimal: {
+            if (auto result = representAs<Decimal128>(value); result) {
+                auto [tag, val] = value::makeCopyDecimal(*result);
+                return {true, tag, val};
+            }
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        default:
+            MONGO_UNREACHABLE
     }
 }
 

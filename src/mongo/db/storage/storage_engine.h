@@ -37,6 +37,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/index_builds.h"
+#include "mongo/db/resumable_index_builds_gen.h"
 #include "mongo/db/storage/temporary_record_store.h"
 #include "mongo/util/functional.h"
 #include "mongo/util/str.h"
@@ -185,15 +186,6 @@ public:
     virtual std::vector<std::string> listDatabases() const = 0;
 
     /**
-     * Returns whether the storage engine supports its own locking locking below the collection
-     * level. If the engine returns true, MongoDB will acquire intent locks down to the
-     * collection level and will assume that the engine will ensure consistency at the level of
-     * documents. If false, MongoDB will lock the entire collection in Shared/Exclusive mode
-     * for read/write operations respectively.
-     */
-    virtual bool supportsDocLocking() const = 0;
-
-    /**
      * Returns whether the storage engine supports capped collections.
      */
     virtual bool supportsCappedCollections() const = 0;
@@ -218,8 +210,12 @@ public:
      * engines that support recoverToStableTimestamp().
      *
      * Must be called with the global lock acquired in exclusive mode.
+     *
+     * Unrecognized idents require special handling based on the context known only to the
+     * caller. For example, on starting from a previous unclean shutdown, we may try to recover
+     * orphaned idents, which are known to the storage engine but not referenced in the catalog.
      */
-    virtual void loadCatalog(OperationContext* opCtx) = 0;
+    virtual void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) = 0;
     virtual void closeCatalog(OperationContext* opCtx) = 0;
 
     /**
@@ -359,13 +355,19 @@ public:
                                      const NamespaceString& nss) = 0;
 
     /**
-     * Creates a temporary RecordStore on the storage engine. This record store will drop itself
-     * automatically when it goes out of scope. This means the TemporaryRecordStore should not exist
-     * any longer than the OperationContext used to create it. On startup, the storage engine will
-     * drop any un-dropped temporary record stores.
+     * Creates a temporary RecordStore on the storage engine. On startup after an unclean shutdown,
+     * the storage engine will drop any un-dropped temporary record stores.
      */
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
         OperationContext* opCtx) = 0;
+
+    /**
+     * Creates a temporary RecordStore on the storage engine from an existing ident on disk. On
+     * startup after an unclean shutdown, the storage engine will drop any un-dropped temporary
+     * record stores.
+     */
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident) = 0;
 
     /**
      * This method will be called before there is a clean shutdown.  Storage engines should
@@ -440,6 +442,15 @@ public:
     virtual void clearDropPendingState() = 0;
 
     /**
+     * Adds 'ident' to a list of indexes/collections whose data will be dropped when:
+     * - the dropTimestamp' is sufficiently old to ensure no future data accesses
+     * - and no holders of 'ident' remain (the index/collection is no longer in active use)
+     */
+    virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
+                                     const NamespaceString& nss,
+                                     std::shared_ptr<Ident> ident) = 0;
+
+    /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
      * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
      * used should be one provided by StorageEngine::setStableTimestamp().
@@ -492,7 +503,7 @@ public:
     /**
      * Returns the initial data timestamp.
      */
-    virtual Timestamp getInitialDataTimestamp() = 0;
+    virtual Timestamp getInitialDataTimestamp() const = 0;
 
     /**
      * Uses the current stable timestamp to set the oldest timestamp for which the storage engine
@@ -511,6 +522,12 @@ public:
      * through. Additionally, all future writes must be newer or equal to this value.
      */
     virtual void setOldestTimestamp(Timestamp timestamp) = 0;
+
+    /**
+     * Gets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through.
+     */
+    virtual Timestamp getOldestTimestamp() const = 0;
 
     /**
      * Sets a callback which returns the timestamp of the oldest oplog entry involved in an
@@ -538,18 +555,28 @@ public:
         // not to completion; they will wait for replicated commit or abort operations. This is a
         // mapping from index build UUID to index build.
         IndexBuilds indexBuildsToRestart;
+
+        // List of index builds to be resumed. Each ResumeIndexInfo may contain multiple indexes to
+        // resume as part of the same build.
+        std::vector<ResumeIndexInfo> indexBuildsToResume;
     };
 
     /**
      * Drop abandoned idents. If successful, returns a ReconcileResult with indexes that need to be
      * rebuilt or builds that need to be restarted.
-     * */
-    virtual StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) = 0;
+     *
+     * Abandoned internal idents require special handling based on the context known only to the
+     * caller. For example, on starting from a previous unclean shutdown, we would always drop all
+     * unknown internal idents. If we started from a clean shutdown, the internal idents may contain
+     * information for resuming index builds.
+     */
+    enum class InternalIdentReconcilePolicy { kDrop, kRetain };
+    virtual StatusWith<ReconcileResult> reconcileCatalogAndIdents(
+        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) = 0;
 
     /**
      * Returns the all_durable timestamp. All transactions with timestamps earlier than the
-     * all_durable timestamp are committed. Only storage engines that support document level locking
-     * must provide an implementation. Other storage engines may provide a no-op implementation.
+     * all_durable timestamp are committed.
      *
      * The all_durable timestamp is the in-memory no holes point. That does not mean that there are
      * no holes behind it on disk. The all_durable timestamp also might not correspond with any

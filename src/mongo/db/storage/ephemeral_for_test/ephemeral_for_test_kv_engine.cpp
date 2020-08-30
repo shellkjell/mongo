@@ -43,10 +43,24 @@
 
 namespace mongo {
 namespace ephemeral_for_test {
+namespace {
+static AtomicWord<bool> shuttingDown{false};
+}  // namespace
+
+bool KVEngine::instanceExists() {
+    return shuttingDown.load();
+}
 
 KVEngine::KVEngine()
-    : mongo::KVEngine(), _visibilityManager(std::make_unique<VisibilityManager>()) {}
-KVEngine::~KVEngine() {}
+    : mongo::KVEngine(), _visibilityManager(std::make_unique<VisibilityManager>()) {
+    _master = std::make_shared<StringStore>();
+    _availableHistory[Timestamp(_masterVersion++, 0)] = _master;
+    shuttingDown.store(false);
+}
+
+KVEngine::~KVEngine() {
+    shuttingDown.store(true);
+}
 
 mongo::RecoveryUnit* KVEngine::newRecoveryUnit() {
     return new RecoveryUnit(this, nullptr);
@@ -71,7 +85,7 @@ std::unique_ptr<mongo::RecordStore> KVEngine::makeTemporaryRecordStore(Operation
 };
 
 
-std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* opCtx,
+std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* unused,
                                                              StringData ns,
                                                              StringData ident,
                                                              const CollectionOptions& options) {
@@ -95,11 +109,15 @@ std::unique_ptr<mongo::RecordStore> KVEngine::getRecordStore(OperationContext* o
 
 bool KVEngine::trySwapMaster(StringStore& newMaster, uint64_t version) {
     stdx::lock_guard<Latch> lock(_masterLock);
-    invariant(!newMaster.hasBranch() && !_master.hasBranch());
+    invariant(!newMaster.hasBranch() && !_master->hasBranch());
     if (_masterVersion != version)
         return false;
-    _master = newMaster;
-    _masterVersion++;
+    // TODO SERVER-48314: replace _masterVersion with a Timestamp of transaction.
+    Timestamp commitTimestamp(_masterVersion++, 0);
+    auto newMasterPtr = std::make_shared<StringStore>(newMaster);
+    _availableHistory[commitTimestamp] = newMasterPtr;
+    _master = newMasterPtr;
+    _cleanHistory(lock);
     return true;
 }
 
@@ -125,7 +143,9 @@ std::unique_ptr<mongo::SortedDataInterface> KVEngine::getSortedDataInterface(
         return std::make_unique<SortedDataInterfaceStandard>(opCtx, ident, desc);
 }
 
-Status KVEngine::dropIdent(OperationContext* opCtx, mongo::RecoveryUnit* ru, StringData ident) {
+Status KVEngine::dropIdent(OperationContext* unusedOpCtx,
+                           mongo::RecoveryUnit* ru,
+                           StringData ident) {
     Status dropStatus = Status::OK();
     stdx::unique_lock lock(_identsLock);
     if (_idents.count(ident.toString()) > 0) {
@@ -135,7 +155,7 @@ Status KVEngine::dropIdent(OperationContext* opCtx, mongo::RecoveryUnit* ru, Str
         lock.unlock();
         if (isRecordStore) {  // ident is RecordStore.
             CollectionOptions s;
-            auto rs = getRecordStore(/*unused*/ opCtx, ""_sd, ident, s);
+            auto rs = getRecordStore(/*unused*/ unusedOpCtx, ""_sd, ident, s);
             dropStatus =
                 checked_cast<RecordStore*>(rs.get())->truncateWithoutUpdatingCount(ru).getStatus();
         } else {  // ident is SortedDataInterface.
@@ -147,6 +167,70 @@ Status KVEngine::dropIdent(OperationContext* opCtx, mongo::RecoveryUnit* ru, Str
         _idents.erase(ident.toString());
     }
     return dropStatus;
+}
+
+std::pair<uint64_t, std::shared_ptr<StringStore>> KVEngine::getMasterInfo(
+    boost::optional<Timestamp> timestamp) {
+    stdx::lock_guard<Latch> lock(_masterLock);
+    if (timestamp && !timestamp->isNull()) {
+        if (timestamp < _getOldestTimestamp(lock)) {
+            uasserted(ErrorCodes::SnapshotTooOld,
+                      str::stream() << "Read timestamp " << timestamp->toString()
+                                    << " is older than the oldest available timestamp.");
+        }
+        auto it = _availableHistory.lower_bound(timestamp.get());
+        return std::make_pair(it->first.asULL(), it->second);
+    }
+    return std::make_pair(_masterVersion, _master);
+}
+
+void KVEngine::cleanHistory() {
+    stdx::lock_guard<Latch> lock(_masterLock);
+    _cleanHistory(lock);
+}
+
+void KVEngine::_cleanHistory(WithLock) {
+    for (auto it = _availableHistory.cbegin(); it != _availableHistory.cend();) {
+        if (it->second.use_count() == 1) {
+            invariant(it->second.get() != _master.get());
+            it = _availableHistory.erase(it);
+        } else {
+            break;
+        }
+    }
+
+    // Check that pointer to master is not deleted.
+    invariant(_availableHistory.size() >= 1);
+}
+
+Timestamp KVEngine::getOldestTimestamp() const {
+    stdx::lock_guard<Latch> lock(_masterLock);
+    return _getOldestTimestamp(lock);
+}
+
+void KVEngine::setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {
+    stdx::lock_guard<Latch> lock(_masterLock);
+    if (newOldestTimestamp > _availableHistory.rbegin()->first) {
+        _availableHistory[newOldestTimestamp] = _master;
+        // TODO SERVER-48314: Remove when _masterVersion is no longer being used to mock commit
+        // timestamps.
+        _masterVersion = newOldestTimestamp.asULL();
+    }
+    for (auto it = _availableHistory.cbegin(); it != _availableHistory.cend();) {
+        if (it->first < newOldestTimestamp) {
+            it = _availableHistory.erase(it);
+        } else {
+            break;
+        }
+    }
+
+    // Check that pointer to master is not deleted.
+    invariant(_availableHistory.size() >= 1);
+}
+
+std::map<Timestamp, std::shared_ptr<StringStore>> KVEngine::getHistory_forTest() {
+    stdx::lock_guard<Latch> lock(_masterLock);
+    return _availableHistory;
 }
 
 class EmptyRecordCursor final : public SeekableRecordCursor {

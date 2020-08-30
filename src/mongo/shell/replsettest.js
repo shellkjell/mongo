@@ -142,7 +142,7 @@ var ReplSetTest = function(opts) {
         // Ensure that only one node is in primary state.
         self.nodes.forEach(function(node) {
             try {
-                node.setSlaveOk();
+                node.setSecondaryOk();
                 var n = node.getDB('admin').runCommand({ismaster: 1});
                 self._liveNodes.push(node);
                 // We verify that the node has a valid config by checking if n.me exists. Then, we
@@ -713,7 +713,9 @@ var ReplSetTest = function(opts) {
         timeout, slaves, connToCheckForUnrecoverableRollback, retryIntervalMS) {
         retryIntervalMS = retryIntervalMS || 200;
         try {
+            MongoRunner.runHangAnalyzer.disable();
             this.awaitSecondaryNodes(timeout, slaves, retryIntervalMS);
+            MongoRunner.runHangAnalyzer.enable();
         } catch (originalEx) {
             // There is a special case where we expect the (rare) possibility of unrecoverable
             // rollbacks with EMRC:false in rollback suites with unclean shutdowns.
@@ -739,6 +741,7 @@ var ReplSetTest = function(opts) {
                             "remote oplog does not contain entry with optime matching our required optime",
                             120 * 1000);
                     } catch (checkLogEx) {
+                        MongoRunner.runHangAnalyzer.enable();
                         throw originalEx;
                     }
                     // Add this info to the original exception.
@@ -746,6 +749,7 @@ var ReplSetTest = function(opts) {
                 }
             }
             // Re-throw the original exception in all cases.
+            MongoRunner.runHangAnalyzer.enable();
             throw originalEx;
         }
     };
@@ -991,7 +995,7 @@ var ReplSetTest = function(opts) {
 
             print("AwaitNodesAgreeOnPrimary: Nodes agreed on primary " + nodes[primary].name);
             return true;
-        }, "Awaiting nodes to agree on primary", timeout);
+        }, "Awaiting nodes to agree on primary timed out", timeout);
     };
 
     /**
@@ -1290,20 +1294,30 @@ var ReplSetTest = function(opts) {
         cmd[cmdKey] = config;
 
         // Initiating a replica set with a single node will use "latest" FCV. This will
-        // cause IncompatibleServerVersion errors if additional "last-stable" binary version
-        // nodes are subsequently added to the set, since such nodes cannot set their FCV to
-        // "latest". Therefore, we make sure the primary is "last-stable" FCV before adding in
-        // nodes of different binary versions to the replica set.
-        let lastStableBinVersionWasSpecifiedForSomeNode = false;
+        // cause IncompatibleServerVersion errors if additional "last-lts"/"last-continuous" binary
+        // version nodes are subsequently added to the set, since such nodes cannot set their FCV to
+        // "latest". Therefore, we make sure the primary is "last-lts"/"last-continuous" FCV before
+        // adding in nodes of different binary versions to the replica set.
+        let lastLTSBinVersionWasSpecifiedForSomeNode = false;
+        let lastContinuousBinVersionWasSpecifiedForSomeNode = false;
         let explicitBinVersionWasSpecifiedForSomeNode = false;
         Object.keys(this.nodeOptions).forEach(function(key, index) {
             let val = self.nodeOptions[key];
             if (typeof (val) === "object" && val.hasOwnProperty("binVersion")) {
-                lastStableBinVersionWasSpecifiedForSomeNode =
-                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastStableFCV);
+                lastLTSBinVersionWasSpecifiedForSomeNode =
+                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastLTSFCV);
+                lastContinuousBinVersionWasSpecifiedForSomeNode =
+                    (lastLTSFCV !== lastContinuousFCV) &&
+                    MongoRunner.areBinVersionsTheSame(val.binVersion, lastContinuousFCV);
                 explicitBinVersionWasSpecifiedForSomeNode = true;
             }
         });
+
+        if (lastLTSBinVersionWasSpecifiedForSomeNode &&
+            lastContinuousBinVersionWasSpecifiedForSomeNode) {
+            throw new Error("Can only specify one of 'last-lts' and 'last-continuous' " +
+                            "in binVersion, not both.");
+        }
 
         // If no binVersions have been explicitly set, then we should be using the latest binary
         // version, which allows us to use the failpoint below.
@@ -1343,26 +1357,33 @@ var ReplSetTest = function(opts) {
         print("ReplSetTest initiate command took " + (new Date() - initiateStart) + "ms for " +
               this.nodes.length + " nodes in set '" + this.name + "'");
 
-        // Set the FCV to 'last-stable' if we are running a mixed version replica set. If this is a
-        // config server, the FCV will be set as part of ShardingTest.
-        let setLastStableFCV = (lastStableBinVersionWasSpecifiedForSomeNode ||
-                                jsTest.options().useRandomBinVersionsWithinReplicaSet) &&
+        // Set the FCV to 'last-lts'/'last-continuous' if we are running a mixed version replica
+        // set. If this is a config server, the FCV will be set as part of ShardingTest.
+        // TODO SERVER-50389: Set FCV to 'last-continuous' properly when last-continuous binary
+        // versions are supported with the useRandomBinVersionsWithinReplicaSet option.
+        let setLastLTSFCV = (lastLTSBinVersionWasSpecifiedForSomeNode ||
+                             jsTest.options().useRandomBinVersionsWithinReplicaSet) &&
             !self.isConfigServer;
-        if (setLastStableFCV && jsTest.options().replSetFeatureCompatibilityVersion) {
+        let setLastContinuousFCV = !setLastLTSFCV &&
+            lastContinuousBinVersionWasSpecifiedForSomeNode && !self.isConfigServer;
+
+        if ((setLastLTSFCV || setLastContinuousFCV) &&
+            jsTest.options().replSetFeatureCompatibilityVersion) {
+            const fcv = setLastLTSFCV ? lastLTSFCV : lastContinuousFCV;
             throw new Error(
-                "The FCV will be set to 'last-stable' automatically when starting up a replica " +
+                "The FCV will be set to '" + fcv + "' automatically when starting up a replica " +
                 "set with mixed binary versions. Therefore, we expect an empty value for " +
                 "'replSetFeatureCompatibilityVersion'.");
         }
 
-        if (setLastStableFCV) {
+        if (setLastLTSFCV || setLastContinuousFCV) {
             // Authenticate before running the command.
             asCluster(self.nodes, function setFCV() {
-                let fcv = lastStableFCV;
+                let fcv = setLastLTSFCV ? lastLTSFCV : lastContinuousFCV;
                 print("Setting feature compatibility version for replica set to '" + fcv + "'");
                 assert.commandWorked(
                     self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv}));
-                checkFCV(self.getPrimary().getDB("admin"), lastStableFCV);
+                checkFCV(self.getPrimary().getDB("admin"), fcv);
                 print("Fetch the config version from primay since 4.4 downgrade runs a reconfig.");
                 config.version = self.getReplSetConfigFromNode().version;
             });
@@ -1596,53 +1617,56 @@ var ReplSetTest = function(opts) {
     };
 
     /**
-     * Steps up 'node' as primary.
-     * Waits for all nodes to reach the same optime before sending the replSetStepUp command
-     * to 'node'.
+     * Steps up 'node' as primary and by default it waits for the stepped up node to become a
+     * writable primary and waits for all nodes to reach the same optime before sending the
+     * replSetStepUp command to 'node'.
+     *
      * Calls awaitReplication() which requires all connections in 'nodes' to be authenticated.
+     * This stepUp() assumes that there is no network partition in the replica set.
      */
-    this.stepUp = function(node) {
-        assert.soon(() => {
+    this.stepUp = function(node, {
+        awaitReplicationBeforeStepUp: awaitReplicationBeforeStepUp = true,
+        awaitWritablePrimary: awaitWritablePrimary = true
+    } = {}) {
+        jsTest.log("ReplSetTest stepUp: Stepping up " + node.host);
+
+        if (awaitReplicationBeforeStepUp) {
             this.awaitReplication();
-            this.awaitNodesAgreeOnAppliedOpTime();
-            this.awaitNodesAgreeOnPrimary();
-            if (this.getPrimary() === node) {
-                return true;
-            }
+        }
 
-            jsTest.log("Stepping up: " + node.host + " in stepUp");
-
-            try {
-                assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
-            } catch (e) {
-                jsTestLog('Failed to step up node ' + node.host + ' in stepUp');
-                return false;
+        assert.soonNoExcept(() => {
+            const res = node.adminCommand({replSetStepUp: 1});
+            // This error is possible if we are running mongoDB binary < 3.4 as
+            // part of multi-version upgrade test. So, for those older branches,
+            // simply wait for the requested node to get elected as primary due
+            // to election timeout.
+            if (!res.ok && res.code === ErrorCodes.CommandNotFound) {
+                jsTest.log(
+                    'replSetStepUp command not supported on node ' + node.host +
+                    " ; so wait for the requested node to get elected due to election timeout.");
+                if (this.getPrimary() === node) {
+                    return true;
+                }
             }
-            this.awaitNodesAgreeOnPrimary();
-            if (this.getPrimary() === node) {
+            assert.commandWorked(res);
+
+            // Since assert.soon() timeout is 10 minutes (default), setting
+            // awaitNodesAgreeOnPrimary() timeout as 1 minute to allow retry of replSetStepUp
+            // command on failure of the replica set to agree on the primary.
+            const timeout = 60 * 100;
+            this.awaitNodesAgreeOnPrimary(timeout, this.nodes, node);
+
+            // getPrimary() guarantees that there will be only one writable primary for a replica
+            // set.
+            if (!awaitWritablePrimary || this.getPrimary() === node) {
                 return true;
             }
 
             jsTest.log(node.host + ' is not primary after stepUp command');
             return false;
         }, "Timed out while waiting for stepUp to succeed on node in port: " + node.port);
-    };
 
-    /**
-     * Steps up 'node' as primary.
-     */
-    this.stepUpNoAwaitReplication = function(node) {
-        jsTest.log("Stepping up: " + node.host + " in stepUpNoAwaitReplication");
-        assert.soonNoExcept(
-            function() {
-                assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
-                self.awaitNodesAgreeOnPrimary(
-                    self.kDefaultTimeoutMS, self.nodes, self.getNodeId(node));
-                return node.adminCommand('replSetGetStatus').myState === ReplSetTest.State.PRIMARY;
-            },
-            'failed to step up node ' + node.host + ' in stepUpNoAwaitReplication',
-            self.kDefaultTimeoutMS);
-
+        jsTest.log("ReplSetTest stepUp: Finished stepping up " + node.host);
         return node;
     };
 
@@ -1980,7 +2004,7 @@ var ReplSetTest = function(opts) {
             print("ReplSetTest awaitReplication: checking secondary #" + secondaryCount + ": " +
                   slaveName);
 
-            slave.getDB("admin").getMongo().setSlaveOk();
+            slave.getDB("admin").getMongo().setSecondaryOk();
 
             var slaveOpTime;
             if (secondaryOpTimeType == ReplSetTest.OpTimeType.LAST_DURABLE) {
@@ -2939,7 +2963,9 @@ var ReplSetTest = function(opts) {
                 options.binVersion = "latest";
             } else {
                 const rand = Random.rand();
-                options.binVersion = rand < 0.5 ? "latest" : "last-stable";
+                // TODO SERVER-50389: Support last-continuous binary version with
+                // useRandomBinVersionsWithinReplicaSet.
+                options.binVersion = rand < 0.5 ? "latest" : "last-lts";
             }
             print("Randomly assigned binary version: " + options.binVersion + " to node: " + n);
         }
@@ -3105,7 +3131,8 @@ var ReplSetTest = function(opts) {
     };
 
     /**
-     * Stops a particular node or nodes, specified by conn or id
+     * Stops a particular node or nodes, specified by conn or id. If we expect the node to exit with
+     * a nonzero exit code, call this function and pass in allowedExitCode as a field of opts.
      *
      * If _useBridge=true, then the mongobridge process(es) corresponding to the node(s) are also
      * terminated unless forRestart=true. The mongobridge process(es) are left running across
@@ -3173,7 +3200,9 @@ var ReplSetTest = function(opts) {
     };
 
     /**
-     * Kill all members of this replica set.
+     * Kill all members of this replica set. When calling this function, we expect all live nodes to
+     * exit cleanly. If we expect a node to exit with a nonzero exit code, use the stop function to
+     * terminate that node before calling stopSet.
      *
      * @param {number} signal The signal number to use for killing the members
      * @param {boolean} forRestart will not cleanup data directory
@@ -3266,6 +3295,11 @@ var ReplSetTest = function(opts) {
             let port = parseInt(conn.port);
             print("ReplSetTest stopSet waiting for mongo program on port " + port + " to stop.");
             let exitCode = waitMongoProgram(port);
+            if (exitCode !== MongoRunner.EXIT_CLEAN) {
+                throw new Error("ReplSetTest stopSet mongo program on port " + port +
+                                " shut down unexpectedly with code " + exitCode + " when code " +
+                                MongoRunner.EXIT_CLEAN + " was expected.");
+            }
             print("ReplSetTest stopSet mongo program on port " + port + " shut down with code " +
                   exitCode);
         }
@@ -3439,10 +3473,34 @@ var ReplSetTest = function(opts) {
 
         var existingNodes = conf.members.map(member => member.host);
         self.ports = existingNodes.map(node => node.split(':')[1]);
-        self.nodes = existingNodes.map(node => new Mongo(node));
+        self.nodes = existingNodes.map(node => {
+            let conn = new Mongo(node);
+            conn.name = conn.host;
+            return conn;
+        });
         self.waitForKeys = false;
         self.host = existingNodes[0].split(':')[0];
         self.name = conf._id;
+    }
+
+    /**
+     * Constructor, which instantiates the ReplSetTest object from existing nodes.
+     */
+    function _constructFromExistingNodes(
+        {name, nodeHosts, nodeOptions, keyFile, host, waitForKeys}) {
+        print('Recreating replica set from existing nodes ' + tojson(nodeHosts));
+
+        self.name = name;
+        self.ports = nodeHosts.map(node => node.split(':')[1]);
+        self.nodes = nodeHosts.map((node) => {
+            const conn = Mongo(node);
+            conn.name = conn.host;
+            return conn;
+        });
+        self.host = host;
+        self.waitForKeys = waitForKeys;
+        self.keyFile = keyFile;
+        self.nodeOptions = nodeOptions;
     }
 
     if (typeof opts === 'string' || opts instanceof String) {
@@ -3452,6 +3510,8 @@ var ReplSetTest = function(opts) {
             // its connections.
             _constructFromExistingSeedNode(opts);
         }, 60);
+    } else if (typeof opts.rstArgs === "object") {
+        _constructFromExistingNodes(opts.rstArgs);
     } else {
         _constructStartNewInstances(opts);
     }

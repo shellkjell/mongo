@@ -34,9 +34,6 @@
 namespace mongo {
 namespace {
 
-/**
- * Vector clock implementation for mongos.
- */
 class VectorClockMongoS : public VectorClock {
     VectorClockMongoS(const VectorClockMongoS&) = delete;
     VectorClockMongoS& operator=(const VectorClockMongoS&) = delete;
@@ -45,25 +42,20 @@ public:
     VectorClockMongoS();
     virtual ~VectorClockMongoS();
 
-protected:
-    bool _gossipOutInternal(OperationContext* opCtx,
-                            BSONObjBuilder* out,
-                            const LogicalTimeArray& time) const override;
-    bool _gossipOutExternal(OperationContext* opCtx,
-                            BSONObjBuilder* out,
-                            const LogicalTimeArray& time) const override;
-    LogicalTimeArray _gossipInInternal(OperationContext* opCtx,
-                                       const BSONObj& in,
-                                       bool couldBeUnauthenticated) override;
-    LogicalTimeArray _gossipInExternal(OperationContext* opCtx,
-                                       const BSONObj& in,
-                                       bool couldBeUnauthenticated) override;
-    bool _permitRefreshDuringGossipOut() const override;
+private:
+    // VectorClock methods implementation
+
+    ComponentSet _gossipInInternal() const override;
+    ComponentSet _gossipOutInternal() const override;
+
+    bool _permitRefreshDuringGossipOut() const override {
+        return true;
+    }
 };
 
 const auto vectorClockMongoSDecoration = ServiceContext::declareDecoration<VectorClockMongoS>();
 
-ServiceContext::ConstructorActionRegisterer _registerer(
+ServiceContext::ConstructorActionRegisterer vectorClockMongoSRegisterer(
     "VectorClockMongoS-VectorClockRegistration",
     {},
     [](ServiceContext* service) {
@@ -76,40 +68,14 @@ VectorClockMongoS::VectorClockMongoS() = default;
 
 VectorClockMongoS::~VectorClockMongoS() = default;
 
-bool VectorClockMongoS::_gossipOutInternal(OperationContext* opCtx,
-                                           BSONObjBuilder* out,
-                                           const LogicalTimeArray& time) const {
-    bool wasClusterTimeOutput = _gossipOutComponent(opCtx, out, time, Component::ClusterTime);
-    _gossipOutComponent(opCtx, out, time, Component::ConfigTime);
-    return wasClusterTimeOutput;
+VectorClock::ComponentSet VectorClockMongoS::_gossipOutInternal() const {
+    return VectorClock::ComponentSet{
+        Component::ClusterTime, Component::ConfigTime, Component::TopologyTime};
 }
 
-bool VectorClockMongoS::_gossipOutExternal(OperationContext* opCtx,
-                                           BSONObjBuilder* out,
-                                           const LogicalTimeArray& time) const {
-    return _gossipOutComponent(opCtx, out, time, Component::ClusterTime);
-}
-
-VectorClock::LogicalTimeArray VectorClockMongoS::_gossipInInternal(OperationContext* opCtx,
-                                                                   const BSONObj& in,
-                                                                   bool couldBeUnauthenticated) {
-    LogicalTimeArray newTime;
-    _gossipInComponent(opCtx, in, couldBeUnauthenticated, &newTime, Component::ClusterTime);
-    _gossipInComponent(opCtx, in, couldBeUnauthenticated, &newTime, Component::ConfigTime);
-    _gossipInComponent(opCtx, in, couldBeUnauthenticated, &newTime, Component::TopologyTime);
-    return newTime;
-}
-
-VectorClock::LogicalTimeArray VectorClockMongoS::_gossipInExternal(OperationContext* opCtx,
-                                                                   const BSONObj& in,
-                                                                   bool couldBeUnauthenticated) {
-    LogicalTimeArray newTime;
-    _gossipInComponent(opCtx, in, couldBeUnauthenticated, &newTime, Component::ClusterTime);
-    return newTime;
-}
-
-bool VectorClockMongoS::_permitRefreshDuringGossipOut() const {
-    return true;
+VectorClock::ComponentSet VectorClockMongoS::_gossipInInternal() const {
+    return VectorClock::ComponentSet{
+        Component::ClusterTime, Component::ConfigTime, Component::TopologyTime};
 }
 
 }  // namespace

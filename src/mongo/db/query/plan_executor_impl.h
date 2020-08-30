@@ -32,6 +32,7 @@
 #include <boost/optional.hpp>
 #include <queue>
 
+#include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_solution.h"
@@ -39,6 +40,7 @@
 namespace mongo {
 
 class CappedInsertNotifier;
+class CollectionScan;
 struct CappedInsertNotifierData;
 
 class PlanExecutorImpl : public PlanExecutor {
@@ -83,7 +85,9 @@ public:
     Timestamp getLatestOplogTimestamp() const final;
     BSONObj getPostBatchResumeToken() const final;
     LockPolicy lockPolicy() const final;
-    bool isPipelineExecutor() const final;
+    std::string getPlanSummary() const final;
+    void getSummaryStats(PlanSummaryStats* statsOut) const final;
+    BSONObj getStats() const final;
 
     /**
      * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
@@ -91,6 +95,11 @@ public:
      * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
      */
     void restoreStateWithoutRetrying();
+
+    /**
+     * Return a pointer to this executor's MultiPlanStage, or nullptr if it does not have one.
+     */
+    MultiPlanStage* getMultiPlanStage() const;
 
 private:
     /**
@@ -107,33 +116,6 @@ private:
      * catalog operation.
      */
     Status _pickBestPlan();
-
-    /**
-     * Returns true if the PlanExecutor should listen for inserts, which is when a getMore is called
-     * on a tailable and awaitData cursor that still has time left and hasn't been interrupted.
-     */
-    bool _shouldListenForInserts();
-
-    /**
-     * Returns true if the PlanExecutor should wait for data to be inserted, which is when a getMore
-     * is called on a tailable and awaitData cursor on a capped collection.  Returns false if an EOF
-     * should be returned immediately.
-     */
-    bool _shouldWaitForInserts();
-
-    /**
-     * Gets the CappedInsertNotifier for a capped collection.  Returns nullptr if this plan executor
-     * is not capable of yielding based on a notifier.
-     */
-    std::shared_ptr<CappedInsertNotifier> _getCappedInsertNotifier();
-
-    /**
-     * Called for tailable and awaitData cursors in order to yield locks and waits for inserts to
-     * the collection being tailed. Returns control to the caller once there has been an insertion
-     * and there may be new results. If the PlanExecutor was killed during a yield, throws an
-     * exception.
-     */
-    void _waitForInserts(CappedInsertNotifierData* notifierData);
 
     ExecState _getNextImpl(Snapshotted<Document>* objOut, RecordId* dlOut);
 
@@ -177,12 +159,11 @@ private:
 
     enum { kUsable, kSaved, kDetached, kDisposed } _currentState = kUsable;
 
-    // A pointer either to a ChangeStreamProxy or a CollectionScan stage, if present in the
-    // execution tree, or nullptr otherwise. We cache it to avoid the need to traverse the execution
-    // tree in runtime when the executor is requested to return the oplog tracking info. Since this
-    // info is provided by either of these stages, the executor will simply delegate the request to
-    // the cached stage.
-    const PlanStage* _oplogTrackingStage{nullptr};
+    // A pointer either to a CollectionScan stage, if present in the execution tree, or nullptr
+    // otherwise. We cache it to avoid the need to traverse the execution tree in runtime when the
+    // executor is requested to return the oplog tracking info. Since this info is provided by
+    // either of these stages, the executor will simply delegate the request to the cached stage.
+    const CollectionScan* _collScanStage{nullptr};
 };
 
 }  // namespace mongo

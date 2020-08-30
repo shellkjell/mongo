@@ -71,15 +71,15 @@ public:
         return Status::OK();
     }
 
+    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
+        return Status::OK();
+    }
+
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
     virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
         return Status::OK();
-    }
-
-    virtual bool supportsDocLocking() const {
-        return true;
     }
 
     virtual bool supportsDirectoryPerDB() const {

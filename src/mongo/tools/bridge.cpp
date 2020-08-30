@@ -56,6 +56,7 @@
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/future.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/str.h"
@@ -248,10 +249,12 @@ class ServiceEntryPointBridge final : public ServiceEntryPointImpl {
 public:
     explicit ServiceEntryPointBridge(ServiceContext* svcCtx) : ServiceEntryPointImpl(svcCtx) {}
 
-    DbResponse handleRequest(OperationContext* opCtx, const Message& request) final;
+    Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                     const Message& request) noexcept final;
 };
 
-DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const Message& request) {
+Future<DbResponse> ServiceEntryPointBridge::handleRequest(OperationContext* opCtx,
+                                                          const Message& request) noexcept try {
     if (request.operation() == dbQuery) {
         DbMessage d(request);
         QueryMessage q(d);
@@ -344,7 +347,8 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         if (!status->isOK()) {
             commandReply = StatusWith<BSONObj>(*status);
         }
-        return {replyBuilder->setCommandReply(std::move(commandReply)).done()};
+        return Future<DbResponse>::makeReady(
+            {replyBuilder->setCommandReply(std::move(commandReply)).done()});
     }
 
 
@@ -361,7 +365,7 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
                   "remote"_attr = dest,
                   "source"_attr = source->remote().toString());
             source->end();
-            return {Message()};
+            return Future<DbResponse>::makeReady({Message()});
         // Forward the message to 'dest' with probability '1 - hostSettings.loss'.
         case HostSettings::State::kDiscard:
             if (dest.nextCanonicalDouble() < hostSettings.loss) {
@@ -381,7 +385,7 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
                           "operation"_attr = networkOpToString(request.operation()),
                           "hostName"_attr = hostName);
                 }
-                return {Message()};
+                return Future<DbResponse>::makeReady({Message()});
             }
         // Forward the message to 'dest' after waiting for 'hostSettings.delay'
         // milliseconds.
@@ -429,7 +433,7 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
                   "remote"_attr = dest,
                   "source"_attr = source->remote());
             source->end();
-            return {Message()};
+            return Future<DbResponse>::makeReady({Message()});
         }
 
         // Only support OP_MSG exhaust cursors.
@@ -447,10 +451,13 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         // whether this should be run again to receive more responses from the exhaust stream.
         // We do not need to set 'nextInvocation' in the DbResponse because mongobridge
         // only receives responses but ignores the next request if it is in exhaust mode.
-        return {std::move(response), isExhaust};
+        return Future<DbResponse>::makeReady({std::move(response), isExhaust});
     } else {
-        return {Message()};
+        return Future<DbResponse>::makeReady({Message()});
     }
+} catch (const DBException& e) {
+    LOGV2_ERROR(4879804, "Failed to handle request", "error"_attr = redact(e));
+    return e.toStatus();
 }
 
 int bridgeMain(int argc, char** argv) {
@@ -478,10 +485,9 @@ int bridgeMain(int argc, char** argv) {
     setGlobalServiceContext(ServiceContext::make());
     auto serviceContext = getGlobalServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointBridge>(serviceContext));
-    serviceContext->setServiceExecutor(
-        std::make_unique<transport::ServiceExecutorSynchronous>(serviceContext));
-
-    fassert(50766, serviceContext->getServiceExecutor()->start());
+    if (auto status = serviceContext->getServiceEntryPoint()->start(); !status.isOK()) {
+        LOGV2(4907203, "Error starting service entry point", "error"_attr = status);
+    }
 
     transport::TransportLayerASIO::Options opts;
     opts.ipList.emplace_back("0.0.0.0");
@@ -490,13 +496,13 @@ int bridgeMain(int argc, char** argv) {
     serviceContext->setTransportLayer(std::make_unique<mongo::transport::TransportLayerASIO>(
         opts, serviceContext->getServiceEntryPoint()));
     auto tl = serviceContext->getTransportLayer();
-    if (!tl->setup().isOK()) {
-        LOGV2(22922, "Error setting up transport layer");
+    if (auto status = tl->setup(); !status.isOK()) {
+        LOGV2(22922, "Error setting up transport layer", "error"_attr = status);
         return EXIT_NET_ERROR;
     }
 
-    if (!tl->start().isOK()) {
-        LOGV2(22923, "Error starting transport layer");
+    if (auto status = tl->start(); !status.isOK()) {
+        LOGV2(22923, "Error starting transport layer", "error"_attr = status);
         return EXIT_NET_ERROR;
     }
 

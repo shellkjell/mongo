@@ -37,7 +37,8 @@ namespace repl {
 ReplicationCoordinatorNoOp::ReplicationCoordinatorNoOp(ServiceContext* service)
     : _service(service) {}
 
-void ReplicationCoordinatorNoOp::startup(OperationContext* opCtx) {}
+void ReplicationCoordinatorNoOp::startup(
+    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {}
 
 void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
@@ -147,9 +148,6 @@ OpTime ReplicationCoordinatorNoOp::getCurrentCommittedSnapshotOpTime() const {
     MONGO_UNREACHABLE;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorNoOp::getCurrentCommittedSnapshotOpTimeAndWallTime() const {
-    MONGO_UNREACHABLE;
-}
 void ReplicationCoordinatorNoOp::appendDiagnosticBSON(mongo::BSONObjBuilder*) {
     MONGO_UNREACHABLE;
 }
@@ -191,10 +189,6 @@ ReplicationCoordinator::ApplierState ReplicationCoordinatorNoOp::getApplierState
 }
 
 void ReplicationCoordinatorNoOp::signalDrainComplete(OperationContext*, long long) {
-    MONGO_UNREACHABLE;
-}
-
-Status ReplicationCoordinatorNoOp::waitForDrainFinish(Milliseconds) {
     MONGO_UNREACHABLE;
 }
 

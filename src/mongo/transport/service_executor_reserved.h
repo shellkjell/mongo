@@ -32,6 +32,7 @@
 #include <deque>
 
 #include "mongo/base/status.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -54,13 +55,18 @@ class ServiceExecutorReserved final : public ServiceExecutor {
 public:
     explicit ServiceExecutorReserved(ServiceContext* ctx, std::string name, size_t reservedThreads);
 
+    static ServiceExecutorReserved* get(ServiceContext* ctx);
+
     Status start() override;
     Status shutdown(Milliseconds timeout) override;
-    Status schedule(Task task, ScheduleFlags flags) override;
+    Status scheduleTask(Task task, ScheduleFlags flags) override;
 
     Mode transportMode() const override {
         return Mode::kSynchronous;
     }
+
+    void runOnDataAvailable(Session* session,
+                            OutOfLineExecutor::Task onCompletionCallback) override;
 
     void appendStats(BSONObjBuilder* bob) const override;
 

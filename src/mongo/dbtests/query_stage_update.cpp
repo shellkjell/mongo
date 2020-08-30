@@ -125,7 +125,7 @@ public:
      * Uses a forward collection scan stage to get the docs, and populates 'out' with
      * the results.
      */
-    void getCollContents(Collection* collection, vector<BSONObj>* out) {
+    void getCollContents(const Collection* collection, vector<BSONObj>* out) {
         WorkingSet ws;
 
         CollectionScanParams params;
@@ -145,7 +145,7 @@ public:
         }
     }
 
-    void getRecordIds(Collection* collection,
+    void getRecordIds(const Collection* collection,
                       CollectionScanParams::Direction direction,
                       vector<RecordId>* out) {
         WorkingSet ws;
@@ -219,7 +219,8 @@ public:
 
             request.setUpsert();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -244,7 +245,7 @@ public:
         // Verify the contents of the resulting collection.
         {
             AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-            Collection* collection = ctx.getCollection();
+            const Collection* collection = ctx.getCollection();
 
             vector<BSONObj> objs;
             getCollContents(collection, &objs);
@@ -293,7 +294,8 @@ public:
 
             request.setMulti();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -351,7 +353,7 @@ public:
         // Check the contents of the collection.
         {
             AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
-            Collection* collection = ctx.getCollection();
+            const Collection* collection = ctx.getCollection();
 
             vector<BSONObj> objs;
             getCollContents(collection, &objs);
@@ -402,7 +404,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
@@ -494,7 +497,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_NEW);

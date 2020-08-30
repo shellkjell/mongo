@@ -86,8 +86,14 @@ public:
      */
     static int Create(OperationContext* opCtx, const std::string& uri, const std::string& config);
 
+    /**
+     * Drops the specified WiredTiger table. This should only be used for resuming index builds.
+     */
+    static int Drop(OperationContext* opCtx, const std::string& uri);
+
     WiredTigerIndex(OperationContext* ctx,
                     const std::string& uri,
+                    StringData ident,
                     const IndexDescriptor* desc,
                     KVPrefix prefix,
                     bool readOnly);
@@ -102,7 +108,7 @@ public:
 
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
-                              ValidateResults* fullResults) const;
+                              IndexValidateResults* fullResults) const;
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
                                    double scale) const;
@@ -191,6 +197,7 @@ class WiredTigerIndexUnique : public WiredTigerIndex {
 public:
     WiredTigerIndexUnique(OperationContext* ctx,
                           const std::string& uri,
+                          StringData ident,
                           const IndexDescriptor* desc,
                           KVPrefix prefix,
                           bool readOnly = false);
@@ -251,6 +258,7 @@ class WiredTigerIndexStandard : public WiredTigerIndex {
 public:
     WiredTigerIndexStandard(OperationContext* ctx,
                             const std::string& uri,
+                            StringData ident,
                             const IndexDescriptor* desc,
                             KVPrefix prefix,
                             bool readOnly = false);

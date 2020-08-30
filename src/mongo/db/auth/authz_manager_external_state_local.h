@@ -62,11 +62,10 @@ public:
     Status getUserDescription(OperationContext* opCtx,
                               const UserRequest& user,
                               BSONObj* result) override;
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat showPrivileges,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+    Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) override;
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                              const std::vector<RoleName>& roleNames,
+                                              ResolveRoleOption option) override;
     Status getRolesDescription(OperationContext* opCtx,
                                const std::vector<RoleName>& roles,
                                PrivilegeFormat showPrivileges,
@@ -77,7 +76,7 @@ public:
                                     PrivilegeFormat showPrivileges,
                                     AuthenticationRestrictionsFormat,
                                     bool showBuiltinRoles,
-                                    std::vector<BSONObj>* result) override;
+                                    BSONArrayBuilder* result) override;
 
     bool hasAnyPrivilegeDocuments(OperationContext* opCtx) final {
         return _hasAnyPrivilegeDocuments.load();
@@ -100,6 +99,13 @@ public:
                            const NamespaceString& collectionName,
                            const BSONObj& query,
                            BSONObj* result) = 0;
+
+    /**
+     * Checks for the existance of a document matching "query" in "collectionName".
+     */
+    virtual bool hasOne(OperationContext* opCtx,
+                        const NamespaceString& collectionName,
+                        const BSONObj& query) = 0;
 
     /**
      * Finds all documents matching "query" in "collectionName".  For each document returned,
@@ -149,11 +155,6 @@ private:
      * Fetches the user document for "userName" from local storage, and stores it into "result".
      */
     Status _getUserDocument(OperationContext* opCtx, const UserName& userName, BSONObj* result);
-
-    Status _getRoleDescription_inlock(const RoleName& roleName,
-                                      PrivilegeFormat showPrivileges,
-                                      AuthenticationRestrictionsFormat showRestrictions,
-                                      BSONObj* result);
 
     /**
      * Returns true if the auth DB contains any users or roles.

@@ -60,6 +60,7 @@
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/vector_clock.h"
@@ -123,7 +124,8 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
     // The appended operationTime must always be <= the appended $clusterTime, so in case we need to
     // use $clusterTime as the operationTime below, take a $clusterTime value which is guaranteed to
     // be <= the value output by gossipOut().
-    auto clusterTime = VectorClock::get(opCtx)->getTime()[VectorClock::Component::ClusterTime];
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
+    const auto clusterTime = currentTime.clusterTime();
 
     bool clusterTimeWasOutput = VectorClock::get(opCtx)->gossipOut(opCtx, responseBuilder);
 
@@ -295,9 +297,10 @@ MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
  */
 void runCommand(OperationContext* opCtx,
                 const OpMsgRequest& request,
-                const NetworkOp opType,
+                const Message& m,
                 rpc::ReplyBuilderInterface* replyBuilder,
                 BSONObjBuilder* errorBuilder) {
+    auto const opType = m.operation();
     auto const commandName = request.getCommandName();
     auto const command = CommandHelpers::findCommand(commandName);
     if (!command) {
@@ -308,6 +311,14 @@ void runCommand(OperationContext* opCtx,
         globalCommandRegistry()->incrementUnknownCommands();
         appendRequiredFieldsToResponse(opCtx, &builder);
         return;
+    }
+
+    opCtx->setExhaust(OpMsg::isFlagSet(m, OpMsg::kExhaustSupported));
+    const auto session = opCtx->getClient()->session();
+    if (session) {
+        if (!opCtx->isExhaust() || command->getName() != "hello"_sd) {
+            InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
+        }
     }
 
     CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
@@ -347,14 +358,10 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
-    auto const apiParamsFromClient = initializeAPIParameters(request.body);
-    APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
-
     auto osi = initializeOperationSessionInfo(opCtx,
                                               request.body,
                                               command->requiresAuth(),
                                               command->attachLogicalSessionsToOpCtx(),
-                                              true,
                                               true);
 
     // TODO SERVER-28756: Change allowTransactionsOnConfigDatabase to true once we fix the bug
@@ -364,17 +371,31 @@ void runCommand(OperationContext* opCtx,
 
     auto wc = uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body));
 
+    Client* client = opCtx->getClient();
+    auto const apiParamsFromClient = initializeAPIParameters(opCtx, request.body, command);
+
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernParseStatus = [&]() {
-        // We must obtain the client lock to set the ReadConcernArgs on the operation
-        // context as it may be concurrently read by CurrentOp.
-        stdx::lock_guard<Client> lk(*opCtx->getClient());
-        return readConcernArgs.initialize(request.body);
-    }();
+    Status readConcernParseStatus = Status::OK();
+    {
+        // We must obtain the client lock to set APIParameters and ReadConcernArgs on the operation
+        // context, as it may be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*client);
+        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+        readConcernParseStatus = readConcernArgs.initialize(request.body);
+    }
+
     if (!readConcernParseStatus.isOK()) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
         return;
+    }
+
+    auto& apiParams = APIParameters::get(opCtx);
+    auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+    if (clientMetadata) {
+        auto appName = clientMetadata.get().getApplicationName().toString();
+        apiVersionMetrics.update(appName, apiParams);
     }
 
     boost::optional<RouterOperationContextSession> routerSession;
@@ -755,7 +776,7 @@ void runCommand(OperationContext* opCtx,
             } catch (ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
                 // Mark database entry in cache as stale.
                 Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
-                                                                         ex->getVersionReceived());
+                                                                         ex->getVersionWanted());
 
                 // Retry logic specific to transactions. Throws and aborts the transaction if the
                 // error cannot be retried on.
@@ -1023,14 +1044,6 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
             }
         }();
 
-        opCtx->setExhaust(OpMsg::isFlagSet(m, OpMsg::kExhaustSupported));
-        const auto session = opCtx->getClient()->session();
-        if (session) {
-            if (!opCtx->isExhaust() || request.getCommandName() != "isMaster"_sd) {
-                InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
-            }
-        }
-
         // Execute.
         std::string db = request.getDatabase().toString();
         try {
@@ -1040,7 +1053,7 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
                         "Command begin",
                         "db"_attr = db,
                         "headerId"_attr = m.header().getId());
-            runCommand(opCtx, request, m.operation(), reply.get(), &errorBuilder);
+            runCommand(opCtx, request, m, reply.get(), &errorBuilder);
             LOGV2_DEBUG(22771,
                         3,
                         "Command end db: {db} msg id: {headerId}",
@@ -1232,7 +1245,7 @@ void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
                            MONGO_UNREACHABLE;
                    }
                }(),
-               msg.operation(),
+               msg,
                &reply,
                &errorBuilder);  // built objects are ignored
 }
@@ -1307,7 +1320,7 @@ void Strategy::explainFind(OperationContext* opCtx,
         } catch (const ExceptionFor<ErrorCodes::StaleDbVersion>& ex) {
             // Mark database entry in cache as stale.
             Grid::get(opCtx)->catalogCache()->onStaleDatabaseVersion(ex->getDb(),
-                                                                     ex->getVersionReceived());
+                                                                     ex->getVersionWanted());
             if (canRetry) {
                 continue;
             }

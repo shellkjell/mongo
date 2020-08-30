@@ -98,6 +98,10 @@ assert.commandWorked(st.rs0.getPrimary().getDB('admin').runCommand({
     epoch: res.versionEpoch,
 }));
 
+// Ensure all the config nodes agree on a config optime that reflects the second split in case a new
+// primary config server steps up.
+st.configRS.awaitLastOpCommitted();
+
 // Perform a read on the config primary to have the mongos get the latest config optime since the
 // last two splits were performed directly on the shards.
 assert.neq(null, st.s.getDB('config').databases.findOne());
@@ -111,8 +115,8 @@ assert.commandWorked(
 // because the chunk size exceeds the limit.
 res = st.s.adminCommand({getShardVersion: ns, fullMetadata: true});
 assert.commandWorked(res);
-assert.eq(res.version.t, 3);
-assert.eq(res.version.i, 10001);
+assert.eq(res.version.t, 1);
+assert.eq(res.version.i, 20002);
 assert.eq(undefined, res.chunks);
 
 st.stop();

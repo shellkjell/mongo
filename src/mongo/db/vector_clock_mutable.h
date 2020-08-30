@@ -44,23 +44,55 @@ public:
     // clock implementation.
     static VectorClockMutable* get(ServiceContext* service);
     static VectorClockMutable* get(OperationContext* ctx);
+
     static void registerVectorClockOnServiceContext(ServiceContext* service,
                                                     VectorClockMutable* vectorClockMutable);
 
     /**
-     * Returns the next time value for this Component, and provides a guarantee that any future call
-     * to tick() (for this Component) will return a value at least 'nTicks' ticks in the future from
-     * the current time.
+     * Returns the next time value for the component, and provides a guarantee that any future call
+     * to tick() will return a value at least 'nTicks' ticks in the future from the current time.
      */
-    virtual LogicalTime tick(Component component, uint64_t nTicks) = 0;
+    LogicalTime tickClusterTime(uint64_t nTicks) {
+        return _tick(Component::ClusterTime, nTicks);
+    }
+    LogicalTime tickConfigTime(uint64_t nTicks) {
+        return _tick(Component::ConfigTime, nTicks);
+    }
+    LogicalTime tickTopologyTime(uint64_t nTicks) {
+        return _tick(Component::TopologyTime, nTicks);
+    }
 
     /**
-     * Authoritatively ticks the current time of the Component to newTime.
+     * Authoritatively ticks the current time of the specified component to newTime.
      *
      * For ClusterTime, this should only be used for initializing from a trusted source, eg. from an
      * oplog timestamp.
      */
-    virtual void tickTo(Component component, LogicalTime newTime) = 0;
+    void tickClusterTimeTo(LogicalTime newTime) {
+        _tickTo(Component::ClusterTime, newTime);
+    }
+    void tickConfigTimeTo(LogicalTime newTime) {
+        _tickTo(Component::ConfigTime, newTime);
+    }
+    void tickTopologyTimeTo(LogicalTime newTime) {
+        _tickTo(Component::TopologyTime, newTime);
+    }
+
+    /**
+     * These methods ensure that the values of the specified vector clock components as of the time
+     * of the call have been durably persisted to disk, before setting the returned future.
+     * Persisting the vector clock ensures that subsequent calls to `recover()` below will bring the
+     * components to at least the persisted time.
+     */
+    virtual SharedSemiFuture<void> waitForDurableConfigTime() = 0;
+    virtual SharedSemiFuture<void> waitForDurableTopologyTime() = 0;
+    virtual SharedSemiFuture<void> waitForDurable() = 0;
+
+    /**
+     * Ensures that the values of the vector clock are at least equal to those from the last
+     * successfully persisted ones.
+     */
+    virtual SharedSemiFuture<void> recover() = 0;
 
 protected:
     VectorClockMutable();
@@ -76,10 +108,24 @@ protected:
     LogicalTime _advanceComponentTimeByTicks(Component component, uint64_t nTicks);
 
     /**
-     * Called by sub-classes in order to actually tickTo a Component time, once they have determined
+     * Called by sublclasses in order to actually tickTo a Component time, once they have determined
      * that doing so is permissible.
      */
     void _advanceComponentTimeTo(Component component, LogicalTime&& newTime);
+
+    /**
+     * Returns the next time value for the component, and provides a guarantee that any future call
+     * to tick() will return a value at least 'nTicks' ticks in the future from the current time.
+     */
+    virtual LogicalTime _tick(Component component, uint64_t nTicks) = 0;
+
+    /**
+     * Authoritatively ticks the current time of the Component to newTime.
+     *
+     * For ClusterTime, this should only be used for initializing from a trusted source, eg. from an
+     * oplog timestamp.
+     */
+    virtual void _tickTo(Component component, LogicalTime newTime) = 0;
 };
 
 }  // namespace mongo

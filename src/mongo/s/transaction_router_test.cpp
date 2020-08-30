@@ -40,7 +40,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/vector_clock.h"
-#include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/router_transactions_metrics.h"
@@ -120,14 +119,14 @@ protected:
                          std::make_tuple(shard2, hostAndPort2),
                          std::make_tuple(shard3, hostAndPort3)});
 
+        APIParameters::get(operationContext()) = APIParameters();
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
         // Set up a logical clock with an initial time.
         auto logicalClock = std::make_unique<LogicalClock>(getServiceContext());
         LogicalClock::set(getServiceContext(), std::move(logicalClock));
-        VectorClock::get(getServiceContext())
-            ->advanceTime_forTest(VectorClock::Component::ClusterTime, kInMemoryLogicalTime);
+        VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
 
         // Set up a tick source for transaction metrics.
         auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
@@ -317,8 +316,15 @@ TEST_F(TransactionRouterTestWithDefaultSession, CannotContiueTxnWithoutStarting)
         ErrorCodes::NoSuchTransaction);
 }
 
-TEST_F(TransactionRouterTestWithDefaultSession, NewParticipantMustAttachTxnAndReadConcern) {
+TEST_F(TransactionRouterTestWithDefaultSession,
+       NewParticipantMustAttachTxnAndReadConcernAndAPIParams) {
     TxnNumber txnNum{3};
+
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("1");
+    apiParameters.setAPIStrict(false);
+    apiParameters.setAPIDeprecationErrors(false);
+    APIParameters::get(operationContext()) = apiParameters;
 
     auto txnRouter = TransactionRouter::get(operationContext());
     txnRouter.beginOrContinueTxn(
@@ -331,6 +337,9 @@ TEST_F(TransactionRouterTestWithDefaultSession, NewParticipantMustAttachTxnAndRe
                                   << BSON("level"
                                           << "snapshot"
                                           << "atClusterTime" << kInMemoryLogicalTime.asTimestamp())
+                                  << "apiVersion"
+                                  << "1"
+                                  << "apiStrict" << false << "apiDeprecationErrors" << false
                                   << "startTransaction" << true << "coordinator" << true
                                   << "autocommit" << false << "txnNumber" << txnNum);
 
@@ -360,6 +369,9 @@ TEST_F(TransactionRouterTestWithDefaultSession, NewParticipantMustAttachTxnAndRe
                           << BSON("level"
                                   << "snapshot"
                                   << "atClusterTime" << kInMemoryLogicalTime.asTimestamp())
+                          << "apiVersion"
+                          << "1"
+                          << "apiStrict" << false << "apiDeprecationErrors" << false
                           << "startTransaction" << true << "autocommit" << false << "txnNumber"
                           << txnNum);
 
@@ -721,6 +733,92 @@ TEST_F(TransactionRouterTestWithDefaultSession, AttachTxnValidatesReadConcernIfA
                                << "autocommit" << false << "txnNumber" << txnNum),
                           newCmd);
     }
+}
+
+TEST_F(TransactionRouterTestWithDefaultSession, AttachTxnAttachesAPIParameters) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    APIParameters::get(operationContext()) = apiParams;
+
+    TxnNumber txnNum{3};
+    auto txnRouter = TransactionRouter::get(operationContext());
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    {
+        auto newCmd = txnRouter.attachTxnFieldsIfNeeded(operationContext(),
+                                                        shard1,
+                                                        BSON("insert"
+                                                             << "test"));
+        ASSERT_BSONOBJ_EQ(BSON("insert"
+                               << "test"
+                               << "readConcern"
+                               << BSON("level"
+                                       << "snapshot"
+                                       << "atClusterTime" << kInMemoryLogicalTime.asTimestamp())
+                               << "apiVersion"
+                               << "2"
+                               << "apiStrict" << true << "apiDeprecationErrors" << true
+                               << "startTransaction" << true << "coordinator" << true
+                               << "autocommit" << false << "txnNumber" << txnNum),
+                          newCmd);
+    }
+}
+
+TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyAPIParametersAfterFirstStatement) {
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("1");
+    APIParameters::get(operationContext()) = apiParameters;
+    TxnNumber txnNum{3};
+
+    auto txnRouter = TransactionRouter::get(operationContext());
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    ASSERT_THROWS_CODE(
+        txnRouter.beginOrContinueTxn(
+            operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue),
+        DBException,
+        4937701);
+}
+
+TEST_F(TransactionRouterTestWithDefaultSession, PassesThroughAPIParametersToParticipants) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    APIParameters::get(operationContext()) = apiParams;
+
+    TxnNumber txnNum{3};
+
+    auto txnRouter = TransactionRouter::get(operationContext());
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    BSONObj expectedNewObj = BSON("insert"
+                                  << "test"
+                                  << "readConcern"
+                                  << BSON("level"
+                                          << "snapshot"
+                                          << "atClusterTime" << kInMemoryLogicalTime.asTimestamp())
+                                  << "apiVersion"
+                                  << "2"
+                                  << "apiStrict" << true << "apiDeprecationErrors" << true
+                                  << "startTransaction" << true << "coordinator" << true
+                                  << "autocommit" << false << "txnNumber" << txnNum);
+
+    auto newCmd = txnRouter.attachTxnFieldsIfNeeded(operationContext(),
+                                                    shard1,
+                                                    BSON("insert"
+                                                         << "test"));
+    ASSERT_BSONOBJ_EQ(expectedNewObj, newCmd);
 }
 
 TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyReadConcernAfterFirstStatement) {
@@ -1429,8 +1527,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, SnapshotErrorsResetAtClusterTime
     // Advance the latest time in the logical clock so the retry attempt will pick a later time.
     LogicalTime laterTime(Timestamp(1000, 1));
     ASSERT_GT(laterTime, kInMemoryLogicalTime);
-    VectorClock::get(operationContext())
-        ->advanceTime_forTest(VectorClock::Component::ClusterTime, laterTime);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTime);
 
     // Simulate a snapshot error.
 
@@ -1479,8 +1576,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeSameStmt(Timestamp(100, 1));
     ASSERT_GT(laterTimeSameStmt, kInMemoryLogicalTime);
-    VectorClock::get(operationContext())
-        ->advanceTime_forTest(VectorClock::Component::ClusterTime, laterTimeSameStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeSameStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -1504,8 +1600,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeNewStmt(Timestamp(1000, 1));
     ASSERT_GT(laterTimeNewStmt, laterTimeSameStmt);
-    VectorClock::get(operationContext())
-        ->advanceTime_forTest(VectorClock::Component::ClusterTime, laterTimeNewStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeNewStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -1753,8 +1848,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTime(Timestamp(1000, 1));
     ASSERT_GT(laterTime, kInMemoryLogicalTime);
-    VectorClock::get(operationContext())
-        ->advanceTime_forTest(VectorClock::Component::ClusterTime, laterTime);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTime);
 
     ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find", kDummyStatus));
     txnRouter.onStaleShardOrDbError(operationContext(), "find", kDummyStatus);
@@ -2269,6 +2363,34 @@ TEST_F(TransactionRouterTestWithDefaultSession, ContinueOnlyOnStaleVersionOnFirs
     ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("update", kStaleConfigStatus));
 }
 
+TEST_F(TransactionRouterTestWithDefaultSession,
+       ContinuingTransactionPlacesItsAPIParametersOnOpCtx) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    APIParameters::get(operationContext()) = apiParams;
+    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+
+    TxnNumber txnNum{3};
+
+    auto txnRouter = TransactionRouter::get(operationContext());
+
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    APIParameters::get(operationContext()) = APIParameters();
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue);
+
+    auto storedAPIParams = APIParameters::get(operationContext());
+    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
+    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
+    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
+}
+
 TEST_F(TransactionRouterTestWithDefaultSession, ContinuingTransactionPlacesItsReadConcernOnOpCtx) {
     TxnNumber txnNum{3};
 
@@ -2320,8 +2442,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeSameStmt(Timestamp(100, 1));
     ASSERT_GT(laterTimeSameStmt, kInMemoryLogicalTime);
-    VectorClock::get(operationContext())
-        ->advanceTime_forTest(VectorClock::Component::ClusterTime, laterTimeSameStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeSameStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -3268,6 +3389,29 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingPrintsTimeActiveAndInactive) {
         1, countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("timeActiveMicros" << 111111))));
     ASSERT_EQUALS(
         1, countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("timeInactiveMicros" << 222222))));
+}
+
+//
+// Slow transaction logging tests for API parameters.
+//
+
+TEST_F(TransactionRouterMetricsTest, SlowLoggingAPIParameters) {
+    APIParameters apiParams = APIParameters();
+    apiParams.setAPIVersion("2");
+    apiParams.setAPIStrict(true);
+    apiParams.setAPIDeprecationErrors(true);
+
+    APIParameters::get(operationContext()) = apiParams;
+
+    beginSlowTxnWithDefaultTxnNumber();
+    runCommit(kDummyOkRes);
+
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON(
+                      "attr" << BSON("parameters" << BSON("apiVersion"
+                                                          << "2"
+                                                          << "apiStrict" << true
+                                                          << "apiDeprecationErrors" << true)))));
 }
 
 //

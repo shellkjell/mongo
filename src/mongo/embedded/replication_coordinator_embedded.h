@@ -45,7 +45,8 @@ public:
 
     // Members that are implemented and safe to call of public ReplicationCoordinator API
 
-    void startup(OperationContext* opCtx) override;
+    void startup(OperationContext* opCtx,
+                 LastStorageEngineShutdownState lastStorageEngineShutdownState) override;
 
     void enterTerminalShutdown() override;
 
@@ -167,8 +168,6 @@ public:
 
     void signalDrainComplete(OperationContext*, long long) override;
 
-    Status waitForDrainFinish(Milliseconds) override;
-
     void signalUpstreamUpdater() override;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
@@ -248,8 +247,6 @@ public:
     Status updateTerm(OperationContext*, long long) override;
 
     repl::OpTime getCurrentCommittedSnapshotOpTime() const override;
-
-    repl::OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) override;
 

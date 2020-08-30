@@ -6,6 +6,7 @@
 //   requires_getmore,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
+//   sbe_incompatible,
 //   uses_map_reduce_with_temp_collections,
 // ]
 
@@ -96,10 +97,12 @@ let viewsCommandTests = {
     _configsvrRenameCollection: {skip: isAnInternalCommand},
     _configsvrRemoveShard: {skip: isAnInternalCommand},
     _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
+    _configsvrReshardCollection: {skip: isAnInternalCommand},
     _configsvrShardCollection: {skip: isAnInternalCommand},
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isUnrelated},
     _flushRoutingTableCacheUpdates: {skip: isUnrelated},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: isUnrelated},
     _getNextSessionMods: {skip: isAnInternalCommand},
     _getUserCacheGeneration: {skip: isAnInternalCommand},
     _hashBSONElement: {skip: isAnInternalCommand},
@@ -117,6 +120,7 @@ let viewsCommandTests = {
     _shardsvrRenameCollection: {skip: isAnInternalCommand},
     _shardsvrShardCollection: {skip: isAnInternalCommand},
     _transferMods: {skip: isAnInternalCommand},
+    _vectorClockPersist: {skip: isAnInternalCommand},
     abortTransaction: {skip: isUnrelated},
     addShard: {skip: isUnrelated},
     addShardToZone: {skip: isUnrelated},
@@ -331,13 +335,13 @@ let viewsCommandTests = {
     grantRolesToRole: {skip: isUnrelated},
     grantRolesToUser: {skip: isUnrelated},
     handshake: {skip: isUnrelated},
+    hello: {skip: isUnrelated},
     hostInfo: {skip: isUnrelated},
     httpClientRequest: {skip: isAnInternalCommand},
     insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
     internalRenameIfOptionsAndIndexesMatch: {skip: isAnInternalCommand},
     invalidateUserCache: {skip: isUnrelated},
     isdbgrid: {skip: isUnrelated},
-    isMaster: {skip: isUnrelated},
     killCursors: {
         setup: function(conn) {
             assert.commandWorked(conn.collection.remove({}));
@@ -416,6 +420,7 @@ let viewsCommandTests = {
     refineCollectionShardKey: {skip: isUnrelated},
     refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
     reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
+    recipientSyncData: {skip: isUnrelated},
     refreshSessions: {skip: isUnrelated},
     reIndex: {
         command: {reIndex: "view"},
@@ -544,6 +549,11 @@ let viewsCommandTests = {
     startRecordingTraffic: {skip: isUnrelated},
     startSession: {skip: isAnInternalCommand},
     stopRecordingTraffic: {skip: isUnrelated},
+    testDeprecation: {skip: isAnInternalCommand},
+    testDeprecationInVersion2: {skip: isAnInternalCommand},
+    testRemoval: {skip: isAnInternalCommand},
+    testVersion2: {skip: isAnInternalCommand},
+    testVersions1And2: {skip: isAnInternalCommand},
     top: {skip: "tested in views/views_stats.js"},
     touch: {skip: wasRemovedInBinaryVersion44},
     unsetSharding: {skip: isAnInternalCommand},

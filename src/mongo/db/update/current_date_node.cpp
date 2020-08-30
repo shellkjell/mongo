@@ -45,9 +45,8 @@ void setValue(ServiceContext* service, mutablebson::Element* element, bool typeI
     if (typeIsDate) {
         invariant(element->setValueDate(mongo::jsTime()));
     } else {
-        invariant(element->setValueTimestamp(VectorClockMutable::get(service)
-                                                 ->tick(VectorClock::Component::ClusterTime, 1)
-                                                 .asTimestamp()));
+        invariant(element->setValueTimestamp(
+            VectorClockMutable::get(service)->tickClusterTime(1).asTimestamp()));
     }
 }
 }  // namespace
@@ -98,7 +97,7 @@ Status CurrentDateNode::init(BSONElement modExpr,
 }
 
 ModifierNode::ModifyResult CurrentDateNode::updateExistingElement(
-    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
+    mutablebson::Element* element, const FieldRef& elementPath) const {
     setValue(_service, element, _typeIsDate);
     return ModifyResult::kNormalUpdate;
 }

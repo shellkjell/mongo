@@ -398,9 +398,6 @@ struct __wt_connection_stats {
     int64_t cache_hazard_checks;
     int64_t cache_hazard_walks;
     int64_t cache_hazard_max;
-    int64_t cache_hs_key_truncate_mix_ts_restart;
-    int64_t cache_hs_key_truncate_mix_ts;
-    int64_t cache_hs_key_truncate_onpage_removal;
     int64_t cache_hs_score;
     int64_t cache_hs_insert;
     int64_t cache_hs_insert_restart;
@@ -412,7 +409,12 @@ struct __wt_connection_stats {
     int64_t cache_hs_read;
     int64_t cache_hs_read_miss;
     int64_t cache_hs_read_squash;
-    int64_t cache_hs_remove_key_truncate;
+    int64_t cache_hs_key_truncate_rts_unstable;
+    int64_t cache_hs_key_truncate_rts;
+    int64_t cache_hs_key_truncate_mix_ts_restart;
+    int64_t cache_hs_key_truncate;
+    int64_t cache_hs_key_truncate_onpage_removal;
+    int64_t cache_hs_key_truncate_mix_ts;
     int64_t cache_hs_write_squash;
     int64_t cache_inmem_splittable;
     int64_t cache_inmem_split;
@@ -478,6 +480,8 @@ struct __wt_connection_stats {
     int64_t cond_auto_wait_skipped;
     int64_t time_travel;
     int64_t file_open;
+    int64_t buckets_dh;
+    int64_t buckets;
     int64_t memory_allocation;
     int64_t memory_free;
     int64_t memory_grow;
@@ -745,6 +749,12 @@ struct __wt_connection_stats {
     int64_t txn_hs_ckpt_duration;
     int64_t txn_checkpoint_time_max;
     int64_t txn_checkpoint_time_min;
+    int64_t txn_checkpoint_handle_duration;
+    int64_t txn_checkpoint_handle_duration_apply;
+    int64_t txn_checkpoint_handle_duration_skip;
+    int64_t txn_checkpoint_handle_applied;
+    int64_t txn_checkpoint_handle_skipped;
+    int64_t txn_checkpoint_handle_walked;
     int64_t txn_checkpoint_time_recent;
     int64_t txn_checkpoint_prep_running;
     int64_t txn_checkpoint_prep_max;
@@ -800,6 +810,7 @@ struct __wt_dsrc_stats {
     int64_t block_size;
     int64_t block_minor;
     int64_t btree_checkpoint_generation;
+    int64_t btree_clean_checkpoint_timer;
     int64_t btree_column_fix;
     int64_t btree_column_internal;
     int64_t btree_column_rle;

@@ -29,18 +29,16 @@
 
 #include <memory>
 
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/primary_only_service_op_observer.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -48,35 +46,33 @@
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 
 using namespace mongo;
 using namespace mongo::repl;
 
+namespace {
 constexpr StringData kTestServiceName = "TestService"_sd;
+
+MONGO_FAIL_POINT_DEFINE(TestServiceHangDuringInitialization);
+MONGO_FAIL_POINT_DEFINE(TestServiceHangDuringStateOne);
+MONGO_FAIL_POINT_DEFINE(TestServiceHangDuringStateTwo);
+MONGO_FAIL_POINT_DEFINE(TestServiceHangDuringCompletion);
+MONGO_FAIL_POINT_DEFINE(TestServiceHangBeforeWritingStateDoc);
+}  // namespace
 
 class TestService final : public PrimaryOnlyService {
 public:
-    explicit TestService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext), _executor(makeTaskExecutor(serviceContext)) {
-        _executor->startup();
-    }
+    enum class State {
+        kInitializing = 0,
+        kOne = 1,
+        kTwo = 2,
+        kDone = 3,
+    };
+
+    explicit TestService(ServiceContext* serviceContext) : PrimaryOnlyService(serviceContext) {}
     ~TestService() = default;
-
-    std::shared_ptr<executor::TaskExecutor> makeTaskExecutor(ServiceContext* serviceContext) {
-        ThreadPool::Options threadPoolOptions;
-        threadPoolOptions.threadNamePrefix = getServiceName() + "-";
-        threadPoolOptions.poolName = getServiceName() + "ThreadPool";
-        threadPoolOptions.onCreateThread = [](const std::string& threadName) {
-            Client::initThread(threadName.c_str());
-            AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
-        };
-
-        auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-        hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
-        return std::make_shared<executor::ThreadPoolTaskExecutor>(
-            std::make_unique<ThreadPool>(threadPoolOptions),
-            executor::makeNetworkInterface("TestServiceNetwork", nullptr, std::move(hookList)));
-    }
 
     StringData getServiceName() const override {
         return kTestServiceName;
@@ -86,35 +82,123 @@ public:
         return NamespaceString("admin", "test_service");
     }
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        const BSONObj& initialState) const override {
-        return std::make_shared<TestService::Instance>(initialState);
+    ThreadPool::Limits getThreadPoolLimits() const override {
+        return ThreadPool::Limits();
     }
 
-    std::unique_ptr<executor::ScopedTaskExecutor> getTaskExecutor() override {
-        return std::make_unique<executor::ScopedTaskExecutor>(_executor);
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
+        BSONObj initialState) const override {
+        return std::make_shared<TestService::Instance>(std::move(initialState));
     }
 
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
-        Instance(const BSONObj& state)
-            : PrimaryOnlyService::TypedInstance<Instance>(), _state(state) {}
+        explicit Instance(BSONObj stateDoc)
+            : PrimaryOnlyService::TypedInstance<Instance>(),
+              _id(stateDoc["_id"].wrap().getOwned()),
+              _stateDoc(std::move(stateDoc)),
+              _state((State)_stateDoc["state"].Int()),
+              _initialState(_state) {}
 
-        SemiFuture<RunOnceResult> runOnce(OperationContext* opCtx) override {
-            return SemiFuture<RunOnceResult>::makeReady(RunOnceResult::kComplete());
+        SemiFuture<void> run(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override {
+            if (MONGO_unlikely(TestServiceHangDuringInitialization.shouldFail())) {
+                TestServiceHangDuringInitialization.pauseWhileSet();
+            }
+
+            return SemiFuture<void>::makeReady()
+                .thenRunOn(**executor)
+                .then([self = shared_from_this()] {
+                    self->_runOnce(State::kInitializing, State::kOne);
+
+                    if (MONGO_unlikely(TestServiceHangDuringStateOne.shouldFail())) {
+                        TestServiceHangDuringStateOne.pauseWhileSet();
+                    }
+                })
+                .then([self = shared_from_this()] {
+                    self->_runOnce(State::kOne, State::kTwo);
+
+                    if (MONGO_unlikely(TestServiceHangDuringStateTwo.shouldFail())) {
+                        TestServiceHangDuringStateTwo.pauseWhileSet();
+                    }
+                })
+                .then([self = shared_from_this()] {
+                    // After this line the shared_ptr maintaining the Instance object is deleted
+                    // from the PrimaryOnlyService's map.  Thus keeping the self reference is
+                    // critical to extend the instance lifetime until all the callbacks using it
+                    // have completed.
+                    self->_runOnce(State::kTwo, State::kDone);
+
+                    if (MONGO_unlikely(TestServiceHangDuringCompletion.shouldFail())) {
+                        TestServiceHangDuringCompletion.pauseWhileSet();
+                    }
+                })
+                .semi();
         }
 
-        const BSONObj& getState() const {
+        int getID() {
+            stdx::lock_guard lk(_mutex);
+            return _id["_id"].Int();
+        }
+
+        State getState() {
+            stdx::lock_guard lk(_mutex);
             return _state;
         }
 
-    private:
-        BSONObj _state;
-    };
+        State getInitialState() {
+            stdx::lock_guard lk(_mutex);
+            return _initialState;
+        }
 
-private:
-    std::shared_ptr<executor::TaskExecutor> _executor;
+    private:
+        void _runOnce(State sourceState, State targetState) {
+            stdx::unique_lock lk(_mutex);
+            if (_state > sourceState) {
+                invariant(_state != State::kDone);
+                return;
+            }
+            invariant(_state == sourceState);
+
+            BSONObj newStateDoc = ([&] {
+                BSONObjBuilder newStateDoc;
+                newStateDoc.appendElements(_id);
+                newStateDoc.append("state", (int)targetState);
+                return newStateDoc.done().getOwned();
+            })();
+            _stateDoc = newStateDoc;
+            _state = targetState;
+
+            lk.unlock();
+
+            // Hang before creating OpCtx so that we can test that OpCtxs created after stepping
+            // down still get interrupted.
+            if (MONGO_unlikely(TestServiceHangBeforeWritingStateDoc.shouldFail())) {
+                TestServiceHangBeforeWritingStateDoc.pauseWhileSet();
+            }
+
+            auto opCtx = cc().makeOperationContext();
+            DBDirectClient client(opCtx.get());
+            if (targetState == State::kDone) {
+                client.remove("admin.test_service", _id);
+            } else {
+                client.update("admin.test_service", _id, newStateDoc, true /*upsert*/);
+            }
+        }
+
+        const InstanceID _id;
+        BSONObj _stateDoc;
+        State _state = State::kInitializing;
+        const State _initialState;
+        Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyServiceTest::TestService::_mutex");
+    };
 };
+
+// Make ASSERT_EQ work with State enums.
+std::ostream& operator<<(std::ostream& os, const TestService::State& state) {
+    os << static_cast<int>(state);
+    return os;
+}
 
 class PrimaryOnlyServiceTest : public ServiceContextMongoDTest {
 public:
@@ -126,10 +210,7 @@ public:
 
         {
             auto opCtx = cc().makeOperationContext();
-
             auto replCoord = std::make_unique<ReplicationCoordinatorMock>(serviceContext);
-            ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
-            ASSERT_OK(replCoord->updateTerm(opCtx.get(), 1));
             ReplicationCoordinator::set(serviceContext, std::move(replCoord));
 
             repl::setOplogCollectionName(serviceContext);
@@ -139,52 +220,82 @@ public:
             OpObserverRegistry* opObserverRegistry =
                 dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
             opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+            opObserverRegistry->addObserver(
+                std::make_unique<PrimaryOnlyServiceOpObserver>(serviceContext));
+
+
+            _registry = PrimaryOnlyServiceRegistry::get(getServiceContext());
+            std::unique_ptr<TestService> service =
+                std::make_unique<TestService>(getServiceContext());
+            _registry->registerService(std::move(service));
+            _registry->onStartup(opCtx.get());
         }
+        stepUp();
+
+        _service = _registry->lookupServiceByName("TestService");
+        ASSERT(_service);
+        auto serviceByNamespace =
+            _registry->lookupServiceByNamespace(NamespaceString("admin.test_service"));
+        ASSERT_EQ(_service, serviceByNamespace);
+
+        _testExecutor = makeTestExecutor();
     }
+
     void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
 
+        _testExecutor->shutdown();
+        _testExecutor->join();
+        _testExecutor.reset();
+
+        _registry->shutdown();
+        _service = nullptr;
+
         ServiceContextMongoDTest::tearDown();
     }
-};
 
-TEST_F(PrimaryOnlyServiceTest, BasicStartNewInstance) {
-    PrimaryOnlyServiceRegistry registry;
-
-    {
-        std::unique_ptr<TestService> service = std::make_unique<TestService>(getServiceContext());
-
-        registry.registerService(std::move(service));
-        registry.onStepUpComplete(nullptr, 1);
+    void stepDown() {
+        _registry->onStepDown();
     }
 
-    auto service = registry.lookupService("TestService");
-    ASSERT(service);
+    void stepUp() {
+        auto opCtx = cc().makeOperationContext();
+        auto replCoord = ReplicationCoordinator::get(getServiceContext());
 
-    BSONObj state = BSON("_id" << 0 << "state"
-                               << "foo");
+        // Advance term
+        _term++;
 
-    // Check that state document collection is empty
-    auto opCtx = makeOperationContext();
-    DBDirectClient client(opCtx.get());
-    auto obj = client.findOne(service->getStateDocumentsNS().toString(), Query());
-    ASSERT(obj.isEmpty());
+        ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
+        ASSERT_OK(replCoord->updateTerm(opCtx.get(), _term));
+        replCoord->setMyLastAppliedOpTimeAndWallTime(
+            OpTimeAndWallTime(OpTime(Timestamp(1, 1), _term), Date_t()));
 
-    // Successfully start a new instance
-    auto fut = service->startNewInstance(opCtx.get(), state);
-    auto instanceID = fut.get();
-    ASSERT_EQ(0, instanceID["_id"].Int());
+        _registry->onStepUpComplete(opCtx.get(), _term);
+    }
 
-    // Check that the state document for the instance was created properly.
-    obj = client.findOne(service->getStateDocumentsNS().toString(), Query());
-    ASSERT_EQ(0, obj["_id"].Int());
-    ASSERT_EQ("foo", obj["state"].String());
+    std::shared_ptr<executor::TaskExecutor> makeTestExecutor() {
+        ThreadPool::Options threadPoolOptions;
+        threadPoolOptions.threadNamePrefix = "PrimaryOnlyServiceTest-";
+        threadPoolOptions.poolName = "PrimaryOnlyServiceTestThreadPool";
+        threadPoolOptions.onCreateThread = [](const std::string& threadName) {
+            Client::initThread(threadName.c_str());
+        };
 
-    // Check that we can look up the Instance by ID.
-    auto instance = TestService::Instance::lookup(service, BSON("_id" << 0));
-    ASSERT_EQ(0, instance.get()->getState()["_id"].Int());
-    ASSERT_EQ("foo", instance.get()->getState()["state"].String());
-}
+        auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
+        auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+            std::make_unique<ThreadPool>(threadPoolOptions),
+            executor::makeNetworkInterface(
+                "PrimaryOnlyServiceTestNetwork", nullptr, std::move(hookList)));
+        executor->startup();
+        return executor;
+    }
+
+protected:
+    PrimaryOnlyServiceRegistry* _registry;
+    PrimaryOnlyService* _service;
+    long long _term = 0;
+    std::shared_ptr<executor::TaskExecutor> _testExecutor;
+};
 
 DEATH_TEST_F(PrimaryOnlyServiceTest,
              DoubleRegisterService,
@@ -198,82 +309,260 @@ DEATH_TEST_F(PrimaryOnlyServiceTest,
     registry.registerService(std::move(service2));
 }
 
-TEST_F(PrimaryOnlyServiceTest, DoubleRegisterInstance) {
-    PrimaryOnlyServiceRegistry registry;
-    {
-        std::unique_ptr<TestService> service = std::make_unique<TestService>(getServiceContext());
-
-        registry.registerService(std::move(service));
-        registry.onStepUpComplete(nullptr, 1);
-    }
-
-    auto service = registry.lookupService("TestService");
-
-    BSONObj state1 = BSON("_id" << 0 << "state"
-                                << "foo");
-    BSONObj state2 = BSON("_id" << 0 << "state"
-                                << "bar");
-
-    auto opCtx = makeOperationContext();
-
-    // Register instance with _id 0
-    auto fut = service->startNewInstance(opCtx.get(), std::move(state1));
-
-    // Assert that registering a second instance with the same _id throws DuplicateKey
-    ASSERT_THROWS_CODE(service->startNewInstance(opCtx.get(), std::move(state2)),
-                       DBException,
-                       ErrorCodes::DuplicateKey);
-
-    // Verify first instance was registered successfully.
-    auto instanceID = fut.get();
-    ASSERT_EQ(0, instanceID["_id"].Int());
-
-    // Check that we can look up the Instance by ID.
-    auto instance = TestService::Instance::lookup(service, BSON("_id" << 0));
-    ASSERT_EQ(0, instance.get()->getState()["_id"].Int());
-    ASSERT_EQ("foo", instance.get()->getState()["state"].String());
+TEST_F(PrimaryOnlyServiceTest, StepUpAfterShutdown) {
+    _registry->shutdown();
+    stepUp();
 }
 
-TEST_F(PrimaryOnlyServiceTest, StepDownDuringRegisterInstance) {
-    PrimaryOnlyServiceRegistry registry;
+TEST_F(PrimaryOnlyServiceTest, BasicCreateInstance) {
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+    ASSERT_EQ(TestService::State::kInitializing, instance->getInitialState());
 
-    {
-        std::unique_ptr<TestService> service = std::make_unique<TestService>(getServiceContext());
+    auto instance2 = TestService::Instance::getOrCreate(_service, BSON("_id" << 1 << "state" << 0));
+    ASSERT(instance2.get());
+    ASSERT_EQ(1, instance2->getID());
+    ASSERT_EQ(TestService::State::kInitializing, instance2->getInitialState());
 
-        registry.registerService(std::move(service));
-        registry.onStepUpComplete(nullptr, 1);
-    }
+    instance->onCompletion().get();
+    ASSERT_EQ(TestService::State::kDone, instance->getState());
 
-    auto service = registry.lookupService("TestService");
-    ASSERT(service);
+    instance2->onCompletion().get();
+    ASSERT_EQ(TestService::State::kDone, instance2->getState());
+}
 
-    BSONObj state = BSON("_id" << 0 << "state"
-                               << "foo");
+TEST_F(PrimaryOnlyServiceTest, LookupInstance) {
+    TestServiceHangDuringCompletion.setMode(FailPoint::alwaysOn);
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
 
-    // Begin starting a new instance, but pause after writing the state document to disk.
-    auto& fp = PrimaryOnlyServiceHangBeforeCreatingInstance;
-    fp.setMode(FailPoint::alwaysOn);
-    auto opCtx = makeOperationContext();
-    auto fut = service->startNewInstance(opCtx.get(), state);
-    fp.waitForTimesEntered(1);
+    auto instance2 = TestService::Instance::lookup(_service, BSON("_id" << 0));
 
-    // Now step down
-    registry.onStepDown();
-    auto replCoord = ReplicationCoordinator::get(opCtx.get());
-    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT(instance2.get());
+    ASSERT_EQ(instance.get(), instance2.get().get());
 
-    // Now allow startNewInstance to complete.
-    fp.setMode(FailPoint::off);
-    auto instanceID = fut.get();
-    ASSERT_EQ(0, instanceID["_id"].Int());
+    TestServiceHangDuringCompletion.setMode(FailPoint::off);
+    instance->onCompletion().get();
 
-    // Check that the Instance was not created since we were are no longer primary.
-    auto instance = TestService::Instance::lookup(service, BSON("_id" << 0));
-    ASSERT_FALSE(instance.is_initialized());
+    // Shouldn't be able to look up instance after it has completed running.
+    auto instance3 = TestService::Instance::lookup(_service, BSON("_id" << 0));
+    ASSERT_FALSE(instance3.is_initialized());
+}
 
-    // Check that the state document for the instance was created properly.
-    DBDirectClient client(opCtx.get());
-    BSONObj obj = client.findOne(service->getStateDocumentsNS().toString(), Query());
-    ASSERT_EQ(0, obj["_id"].Int());
-    ASSERT_EQ("foo", obj["state"].String());
+TEST_F(PrimaryOnlyServiceTest, DoubleCreateInstance) {
+    // Make sure the first instance doesn't complete before we try to create the second.
+    TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    ASSERT(instance.get());
+    ASSERT_EQ(0, instance->getID());
+
+    // Trying to create a new instance with the same _id but different state otherwise just returns
+    // the already existing instance based on the _id only.
+    auto instance2 = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 1));
+    ASSERT_EQ(instance.get(), instance2.get());
+
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+}
+
+TEST_F(PrimaryOnlyServiceTest, CreateWhenNotPrimary) {
+    _registry->onStepDown();
+
+    ASSERT_THROWS_CODE(
+        TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0)),
+        DBException,
+        ErrorCodes::NotMaster);
+}
+
+TEST_F(PrimaryOnlyServiceTest, CreateWithoutID) {
+    ASSERT_THROWS_CODE(
+        TestService::Instance::getOrCreate(_service, BSON("state" << 0)), DBException, 4908702);
+}
+
+TEST_F(PrimaryOnlyServiceTest, StepDownBeforePersisted) {
+    // Prevent the instance from writing its initial state document to the storage engine.
+    auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangDuringInitialization.waitForTimesEntered(++timesEntered);
+    stepDown();
+    TestServiceHangDuringInitialization.setMode(FailPoint::off);
+
+    ASSERT_THROWS_CODE_AND_WHAT(instance->onCompletion().get(),
+                                DBException,
+                                ErrorCodes::InterruptedDueToReplStateChange,
+                                "PrimaryOnlyService executor shut down due to stepDown");
+
+    stepUp();
+
+    // Since the Instance never wrote its state document, it shouldn't be recreated on stepUp.
+    auto recreatedInstance = TestService::Instance::lookup(_service, BSON("_id" << 0));
+    ASSERT(!recreatedInstance.is_initialized());
+}
+
+TEST_F(PrimaryOnlyServiceTest, RecreateInstanceOnStepUp) {
+    // Cause the Instance to be interrupted after writing its initial state document in state 1.
+    auto stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangDuringStateOne.waitForTimesEntered(++stateOneFPTimesEntered);
+
+    ASSERT_EQ(TestService::State::kInitializing, instance->getInitialState());
+    ASSERT_EQ(TestService::State::kOne, instance->getState());
+
+    stepDown();
+
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+    auto stateTwoFPTimesEntered = TestServiceHangDuringStateTwo.setMode(FailPoint::alwaysOn);
+
+    stepUp();
+
+    auto recreatedInstance = TestService::Instance::lookup(_service, BSON("_id" << 0)).get();
+    ASSERT_EQ(TestService::State::kOne, recreatedInstance->getInitialState());
+    TestServiceHangDuringStateTwo.waitForTimesEntered(++stateTwoFPTimesEntered);
+    ASSERT_EQ(TestService::State::kTwo, recreatedInstance->getState());
+
+    stepDown();
+
+    TestServiceHangDuringStateTwo.setMode(FailPoint::off);
+    // Need to block instance execution after it's started running but before it's completed so that
+    // the lookup() call later can find the Instance.
+    stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+
+    stepUp();
+
+    recreatedInstance = TestService::Instance::lookup(_service, BSON("_id" << 0)).get();
+    ASSERT_EQ(TestService::State::kTwo, recreatedInstance->getInitialState());
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+    recreatedInstance->onCompletion().get();
+    ASSERT_EQ(TestService::State::kDone, recreatedInstance->getState());
+
+    auto nonExistentInstance = TestService::Instance::lookup(_service, BSON("_id" << 0));
+    ASSERT(!nonExistentInstance.is_initialized());
+
+    stepDown();
+    stepUp();
+
+    // No Instance should be recreated since the previous run completed successfully and deleted its
+    // state document.
+    auto nonExistentInstance2 = TestService::Instance::lookup(_service, BSON("_id" << 0));
+    ASSERT(!nonExistentInstance2.is_initialized());
+}
+
+TEST_F(PrimaryOnlyServiceTest, StepDownBeforeRebuildingInstances) {
+    // Cause the Instance to be interrupted after writing its initial state document in state 1.
+    auto stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangDuringStateOne.waitForTimesEntered(++stateOneFPTimesEntered);
+
+    ASSERT_EQ(TestService::State::kInitializing, instance->getInitialState());
+    ASSERT_EQ(TestService::State::kOne, instance->getState());
+
+    stepDown();
+
+    // Let the running instance terminate.
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+    // Make the instance rebuild on stepUp hang
+    auto rebuildingFPTimesEntered =
+        PrimaryOnlyServiceHangBeforeRebuildingInstances.setMode(FailPoint::alwaysOn);
+
+    stepUp();
+
+    // Start an async task to lookup the rebuilt instance, this will block waiting on the rebuild to
+    // finish.
+    auto getInstanceFuture = SemiFuture<void>::makeReady().thenRunOn(_testExecutor).then([this]() {
+        return TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    });
+    PrimaryOnlyServiceHangBeforeRebuildingInstances.waitForTimesEntered(++rebuildingFPTimesEntered);
+    ASSERT_FALSE(getInstanceFuture.isReady());
+
+    // Stepdown, interrupting the thread waiting for the rebuilt instance.
+    stepDown();
+
+    // Let the previous stepUp attempt continue and realize that the node has since stepped down.
+    PrimaryOnlyServiceHangBeforeRebuildingInstances.setMode(FailPoint::off);
+    ASSERT_THROWS_CODE(getInstanceFuture.get(), DBException, ErrorCodes::NotMaster);
+
+    // Now do another stepUp that is allowed to complete this time.
+    stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+    stepUp();
+    TestServiceHangDuringStateOne.waitForTimesEntered(++stateOneFPTimesEntered);
+
+    instance = TestService::Instance::lookup(_service, BSON("_id" << 0)).get();
+    ASSERT_EQ(TestService::State::kOne, instance->getInitialState());
+    ASSERT_EQ(TestService::State::kOne, instance->getState());
+
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+
+    instance->onCompletion().get();
+}
+
+TEST_F(PrimaryOnlyServiceTest, RecreateInstancesFails) {
+    // Cause the Instance to be interrupted after writing its initial state document in state 1.
+    auto stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangDuringStateOne.waitForTimesEntered(++stateOneFPTimesEntered);
+
+    ASSERT_EQ(TestService::State::kInitializing, instance->getInitialState());
+    ASSERT_EQ(TestService::State::kOne, instance->getState());
+
+    stepDown();
+
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+    // Make querying the state document collection on stepUp fail
+    PrimaryOnlyServiceFailRebuildingInstances.setMode(FailPoint::alwaysOn);
+
+    stepUp();
+
+    // Now that rebuilding the service on stepUp failed, all subsequent operations on that service
+    // will fail until the next stepDown.
+    ASSERT_THROWS_CODE(TestService::Instance::lookup(_service, BSON("_id" << 0)),
+                       DBException,
+                       ErrorCodes::InternalError);
+    ASSERT_THROWS_CODE(
+        TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0)),
+        DBException,
+        ErrorCodes::InternalError);
+
+    stepDown();
+
+    // After stepping down we are in a consistent state again, but cannot create or lookup instances
+    // because we are not primary.
+    ASSERT_FALSE(TestService::Instance::lookup(_service, BSON("_id" << 0)).is_initialized());
+    ASSERT_THROWS_CODE(
+        TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0)),
+        DBException,
+        ErrorCodes::NotMaster);
+
+    // Allow the next stepUp to succeed.
+    PrimaryOnlyServiceFailRebuildingInstances.setMode(FailPoint::off);
+    stateOneFPTimesEntered = TestServiceHangDuringStateOne.setMode(FailPoint::alwaysOn);
+
+    stepUp();
+    TestServiceHangDuringStateOne.waitForTimesEntered(++stateOneFPTimesEntered);
+
+    // Instance should be recreated successfully.
+    instance = TestService::Instance::lookup(_service, BSON("_id" << 0)).get();
+    ASSERT_EQ(TestService::State::kOne, instance->getInitialState());
+    ASSERT_EQ(TestService::State::kOne, instance->getState());
+    TestServiceHangDuringStateOne.setMode(FailPoint::off);
+    instance->onCompletion().get();
+    ASSERT_EQ(TestService::State::kDone, instance->getState());
+}
+
+TEST_F(PrimaryOnlyServiceTest, OpCtxInterruptedByStepdown) {
+    // Ensure that if work has already been scheduled on the executor, but hasn't yet created an
+    // OpCtx, and then we stepDown, that the OpCtx that gets created still gets interrupted.
+    auto timesEntered = TestServiceHangBeforeWritingStateDoc.setMode(FailPoint::alwaysOn);
+
+    auto instance = TestService::Instance::getOrCreate(_service, BSON("_id" << 0 << "state" << 0));
+    TestServiceHangBeforeWritingStateDoc.waitForTimesEntered(++timesEntered);
+    stepDown();
+    TestServiceHangBeforeWritingStateDoc.setMode(FailPoint::off);
+
+    ASSERT_EQ(ErrorCodes::NotMaster, instance->onCompletion().getNoThrow());
 }

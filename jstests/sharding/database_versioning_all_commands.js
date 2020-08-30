@@ -5,7 +5,7 @@
 (function() {
 'use strict';
 
-load('jstests/sharding/libs/last_stable_mongos_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 function getNewDbName(dbName) {
     if (!getNewDbName.counter) {
@@ -451,6 +451,7 @@ let testCases = {
     grantPrivilegesToRole: {skip: "always targets the config server"},
     grantRolesToRole: {skip: "always targets the config server"},
     grantRolesToUser: {skip: "always targets the config server"},
+    hello: {skip: "executes locally on mongos (not sent to any remote node)"},
     hostInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
     insert: {
         run: {
@@ -462,7 +463,6 @@ let testCases = {
     },
     invalidateUserCache: {skip: "executes locally on mongos (not sent to any remote node)"},
     isdbgrid: {skip: "executes locally on mongos (not sent to any remote node)"},
-    isMaster: {skip: "executes locally on mongos (not sent to any remote node)"},
     killCursors: {skip: "requires a previously established cursor"},
     killAllSessions: {skip: "always broadcast to all hosts in the cluster"},
     killAllSessionsByPattern: {skip: "always broadcast to all hosts in the cluster"},
@@ -626,6 +626,11 @@ let testCases = {
     startRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
     startSession: {skip: "executes locally on mongos (not sent to any remote node)"},
     stopRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testDeprecation: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testDeprecationInVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testRemoval: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersions1And2: {skip: "executes locally on mongos (not sent to any remote node)"},
     update: {
         run: {
             sendsDbVersion: true,
@@ -666,7 +671,7 @@ let testCases = {
 };
 
 commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
-    testCases[cmd] = {skip: "must define test coverage for 4.6 backwards compatibility"};
+    testCases[cmd] = {skip: "must define test coverage for latest version backwards compatibility"};
 });
 
 const st = new ShardingTest({shards: 2, mongos: 2});

@@ -34,6 +34,7 @@
 #include "mongo/db/query/plan_executor_factory.h"
 
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/query/plan_executor_impl.h"
 #include "mongo/db/query/plan_executor_sbe.h"
 #include "mongo/logv2/log.h"
@@ -112,6 +113,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     OperationContext* opCtx,
     std::unique_ptr<CanonicalQuery> cq,
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
+    const Collection* collection,
     NamespaceString nss,
     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy) {
 
@@ -128,6 +130,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     auto exec = new PlanExecutorSBE(opCtx,
                                     std::move(cq),
                                     std::move(root),
+                                    collection,
                                     std::move(nss),
                                     false,
                                     boost::none,
@@ -139,6 +142,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
     OperationContext* opCtx,
     std::unique_ptr<CanonicalQuery> cq,
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
+    const Collection* collection,
     NamespaceString nss,
     std::queue<std::pair<BSONObj, boost::optional<RecordId>>> stash,
     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy) {
@@ -151,9 +155,24 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
                 "slots"_attr = data.debugString(),
                 "stages"_attr = sbe::DebugPrinter{}.print(rootStage.get()));
 
-    auto exec = new PlanExecutorSBE(
-        opCtx, std::move(cq), std::move(root), std::move(nss), true, stash, std::move(yieldPolicy));
+    auto exec = new PlanExecutorSBE(opCtx,
+                                    std::move(cq),
+                                    std::move(root),
+                                    collection,
+                                    std::move(nss),
+                                    true,
+                                    stash,
+                                    std::move(yieldPolicy));
     return {{exec, PlanExecutor::Deleter{opCtx}}};
+}
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> make(
+    boost::intrusive_ptr<ExpressionContext> expCtx,
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
+    bool isChangeStream) {
+    auto* opCtx = expCtx->opCtx;
+    auto exec = new PlanExecutorPipeline(std::move(expCtx), std::move(pipeline), isChangeStream);
+    return {exec, PlanExecutor::Deleter{opCtx}};
 }
 
 }  // namespace mongo::plan_executor_factory

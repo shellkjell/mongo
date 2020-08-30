@@ -30,18 +30,18 @@
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
-#include "mongo/db/s/catalog_cache_loader_mock.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
+#include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/util/future.h"
 
@@ -56,14 +56,6 @@ UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
     ASSERT(autoColl.getCollection());
 
     return autoColl.getCollection()->uuid();
-}
-
-void addRangeToReceivingChunks(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const ChunkRange& range) {
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-    std::ignore = CollectionShardingRuntime::get(opCtx, nss)->beginReceive(range);
 }
 
 template <typename ShardKey>
@@ -346,8 +338,7 @@ public:
         _clusterId = OID::gen();
         ShardingState::get(getServiceContext())->setInitialized(_myShardName, _clusterId);
 
-        std::unique_ptr<CatalogCacheLoaderMock> mockLoader =
-            std::make_unique<CatalogCacheLoaderMock>();
+        auto mockLoader = std::make_unique<CatalogCacheLoaderMock>();
         _mockCatalogCacheLoader = mockLoader.get();
         CatalogCacheLoader::set(getServiceContext(), std::move(mockLoader));
 

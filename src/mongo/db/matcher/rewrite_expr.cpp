@@ -44,11 +44,8 @@ using CmpOp = ExpressionCompare::CmpOp;
 
 RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expression>& expression,
                                                 const CollatorInterface* collator) {
-    LOGV2_DEBUG(20725,
-                5,
-                "Expression prior to rewrite: {expression}",
-                "Expression prior to rewrite",
-                "expression"_attr = expression->serialize(false));
+    LOGV2_DEBUG(
+        20725, 5, "Expression prior to rewrite", "expression"_attr = expression->serialize(false));
 
     RewriteExpr rewriteExpr(collator);
     std::unique_ptr<MatchExpression> matchExpression;
@@ -57,13 +54,11 @@ RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expre
         matchExpression = std::move(matchTree);
         LOGV2_DEBUG(20726,
                     5,
-                    "Post-rewrite MatchExpression: {expression}",
                     "Post-rewrite MatchExpression",
                     "expression"_attr = matchExpression->debugString());
         matchExpression = MatchExpression::optimize(std::move(matchExpression));
         LOGV2_DEBUG(20727,
                     5,
-                    "Post-rewrite/post-optimized MatchExpression: {expression}",
                     "Post-rewrite/post-optimized MatchExpression",
                     "expression"_attr = matchExpression->debugString());
     }
@@ -97,7 +92,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
     }
 
     if (andMatch->numChildren() > 0) {
-        return std::move(andMatch);
+        return andMatch;
     }
 
     return nullptr;
@@ -118,7 +113,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteOrExpression(
     }
 
     if (orMatch->numChildren() > 0) {
-        return std::move(orMatch);
+        return orMatch;
     }
 
     return nullptr;
@@ -166,7 +161,7 @@ std::unique_ptr<MatchExpression> RewriteExpr::_buildComparisonMatchExpression(
         std::make_unique<InternalExprEqMatchExpression>(fieldAndValue.fieldName(), fieldAndValue);
     eqMatchExpr->setCollator(_collator);
 
-    return std::move(eqMatchExpr);
+    return eqMatchExpr;
 }
 
 bool RewriteExpr::_canRewriteComparison(

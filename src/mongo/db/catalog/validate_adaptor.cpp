@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/throttle_cursor.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -68,26 +69,21 @@ const long long kInterruptIntervalNumBytes = 50 * 1024 * 1024;  // 50MB.
 Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                        const RecordId& recordId,
                                        const RecordData& record,
-                                       size_t* dataSize) {
-    BSONObj recordBson;
-    try {
-        recordBson = record.toBson();
-    } catch (...) {
-        return exceptionToStatus();
-    }
-
-    const Status status = validateBSON(recordBson.objdata(), recordBson.objsize());
-    if (status.isOK()) {
-        *dataSize = recordBson.objsize();
-    } else {
+                                       size_t* dataSize,
+                                       ValidateResults* results) {
+    const Status status = validateBSON(record.data(), record.size());
+    if (!status.isOK())
         return status;
-    }
+
+    BSONObj recordBson = record.toBson();
+    *dataSize = recordBson.objsize();
 
     if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
         LOGV2(4666601, "[validate]", "recordId"_attr = recordId, "recordData"_attr = recordBson);
     }
 
-    const IndexCatalog* indexCatalog = _validateState->getCollection()->getIndexCatalog();
+    Collection* coll = _validateState->getCollection();
+    IndexCatalog* indexCatalog = coll->getIndexCatalog();
     if (!indexCatalog->haveAnyIndexes()) {
         return status;
     }
@@ -120,26 +116,59 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                 documentKeySet->size(),
                 {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
                 *documentMultikeyPaths)) {
-            std::string msg = str::stream()
-                << "Index " << descriptor->indexName() << " is not multi-key but has more than one"
-                << " key in document " << recordId;
-            ValidateResults& curRecordResults = (*_indexNsResultsMap)[descriptor->indexName()];
-            curRecordResults.errors.push_back(msg);
-            curRecordResults.valid = false;
-            if (crashOnMultikeyValidateFailure.shouldFail()) {
-                invariant(false, msg);
+            if (_validateState->shouldRunRepair()) {
+                writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns().ns(), [&] {
+                    WriteUnitOfWork wuow(opCtx);
+                    indexCatalog->setMultikeyPaths(opCtx, coll, descriptor, *documentMultikeyPaths);
+                    wuow.commit();
+                });
+
+                LOGV2(4614700,
+                      "Index set to multikey",
+                      "indexName"_attr = descriptor->indexName(),
+                      "collection"_attr = coll->ns().ns());
+                results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
+                                                          << " set to multikey.");
+                results->repaired = true;
+            } else {
+                auto& curRecordResults = (results->indexResultsMap)[descriptor->indexName()];
+                std::string msg = str::stream() << "Index " << descriptor->indexName()
+                                                << " is not multikey but has more than one"
+                                                << " key in document " << recordId;
+                curRecordResults.errors.push_back(msg);
+                curRecordResults.valid = false;
+                if (crashOnMultikeyValidateFailure.shouldFail()) {
+                    invariant(false, msg);
+                }
             }
         }
 
         if (index->isMultikey()) {
             const MultikeyPaths& indexPaths = index->getMultikeyPaths(opCtx);
             if (!MultikeyPathTracker::covers(indexPaths, *documentMultikeyPaths.get())) {
-                std::string msg = str::stream()
-                    << "Index " << descriptor->indexName()
-                    << " multi-key paths do not cover a document. RecordId: " << recordId;
-                ValidateResults& curRecordResults = (*_indexNsResultsMap)[descriptor->indexName()];
-                curRecordResults.errors.push_back(msg);
-                curRecordResults.valid = false;
+                if (_validateState->shouldRunRepair()) {
+                    writeConflictRetry(opCtx, "increaseMultikeyPathCoverage", coll->ns().ns(), [&] {
+                        WriteUnitOfWork wuow(opCtx);
+                        indexCatalog->setMultikeyPaths(
+                            opCtx, coll, descriptor, *documentMultikeyPaths);
+                        wuow.commit();
+                    });
+
+                    LOGV2(4614701,
+                          "Multikey paths updated to cover multikey document",
+                          "indexName"_attr = descriptor->indexName(),
+                          "collection"_attr = coll->ns().ns());
+                    results->warnings.push_back(str::stream() << "Index " << descriptor->indexName()
+                                                              << " multikey paths updated.");
+                    results->repaired = true;
+                } else {
+                    std::string msg = str::stream()
+                        << "Index " << descriptor->indexName()
+                        << " multikey paths do not cover a document. RecordId: " << recordId;
+                    auto& curRecordResults = (results->indexResultsMap)[descriptor->indexName()];
+                    curRecordResults.errors.push_back(msg);
+                    curRecordResults.valid = false;
+                }
             }
         }
 
@@ -170,7 +199,7 @@ void _validateKeyOrder(OperationContext* opCtx,
                        const IndexCatalogEntry* index,
                        const KeyString::Value& currKey,
                        const KeyString::Value& prevKey,
-                       ValidateResults* results) {
+                       IndexValidateResults* results) {
     auto descriptor = index->descriptor();
     bool unique = descriptor->unique();
 
@@ -219,6 +248,7 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
                                     ValidateResults* results) {
     const IndexDescriptor* descriptor = index->descriptor();
     auto indexName = descriptor->indexName();
+    auto& indexResults = results->indexResultsMap[indexName];
     IndexInfo& indexInfo = _indexConsistency->getIndexInfo(indexName);
     int64_t numKeys = 0;
 
@@ -255,7 +285,7 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
 
         if (!isFirstEntry) {
             _validateKeyOrder(
-                opCtx, index, indexEntry->keyString, prevIndexKeyStringValue, results);
+                opCtx, index, indexEntry->keyString, prevIndexKeyStringValue, &indexResults);
         }
 
         const RecordId kWildcardMultikeyMetadataRecordId{
@@ -268,7 +298,8 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
             continue;
         }
 
-        _indexConsistency->addIndexKey(indexEntry->keyString, &indexInfo, indexEntry->loc);
+        _indexConsistency->addIndexKey(
+            opCtx, indexEntry->keyString, &indexInfo, indexEntry->loc, results);
         _progress->hit();
         numKeys++;
         isFirstEntry = false;
@@ -314,6 +345,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
     // of records when we begin traversing, even if this number may deviate from the final number.
     const char* curopMessage = "Validate: scanning documents";
     const auto totalRecords = _validateState->getCollection()->getRecordStore()->numRecords(opCtx);
+    const auto rs = _validateState->getCollection()->getRecordStore();
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
         _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, totalRecords));
@@ -332,7 +364,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
-        Status status = validateRecord(opCtx, record->id, record->data, &validatedSize);
+        Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
         if (prevRecordId.isValid()) {
@@ -342,15 +374,8 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         // validatedSize = dataSize is not a general requirement as some storage engines may use
         // padding, but we still require that they return the unpadded record data.
         if (!status.isOK() || validatedSize != static_cast<size_t>(dataSize)) {
-            if (!status.isOK() && validatedSize != static_cast<size_t>(dataSize)) {
-                LOGV2(4835000,
-                      "Document corruption details - Multiple causes for document validation "
-                      "failure; error status and size mismatch",
-                      "recordId"_attr = record->id,
-                      "validatedBytes"_attr = validatedSize,
-                      "recordBytes"_attr = dataSize,
-                      "error"_attr = status);
-            } else if (!status.isOK()) {
+            // If status is not okay, dataSize is not reliable.
+            if (!status.isOK()) {
                 LOGV2(4835001,
                       "Document corruption details - Document validation failed with error",
                       "recordId"_attr = record->id,
@@ -363,21 +388,33 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                       "recordBytes"_attr = dataSize);
             }
 
-            // Only log once
-            if (results->valid) {
-                results->errors.push_back("Detected one or more invalid documents. See logs.");
-                results->valid = false;
-            }
+            if (_validateState->shouldRunRepair()) {
+                writeConflictRetry(
+                    opCtx, "corrupt record removal", _validateState->nss().ns(), [&] {
+                        WriteUnitOfWork wunit(opCtx);
+                        rs->deleteRecord(opCtx, record->id);
+                        wunit.commit();
+                    });
+                results->repaired = true;
+                results->numRemovedCorruptRecords++;
+                _numRecords--;
+            } else {
+                if (results->valid) {
+                    results->errors.push_back("Detected one or more invalid documents. See logs.");
+                    results->valid = false;
+                }
 
-            numCorruptRecordsSizeBytes += sizeof(record->id);
-            if (numCorruptRecordsSizeBytes <= kMaxErrorSizeBytes) {
-                results->corruptRecords.push_back(record->id);
-            } else if (!corruptRecordsSizeLimitWarning) {
-                results->errors.push_back(
-                    "Not all corrupted records are listed due to size limitations.");
-                corruptRecordsSizeLimitWarning = true;
+                numCorruptRecordsSizeBytes += sizeof(record->id);
+                if (numCorruptRecordsSizeBytes <= kMaxErrorSizeBytes) {
+                    results->corruptRecords.push_back(record->id);
+                } else if (!corruptRecordsSizeLimitWarning) {
+                    results->warnings.push_back(
+                        "Not all corrupted records are listed due to size limitations.");
+                    corruptRecordsSizeLimitWarning = true;
+                }
+
+                nInvalid++;
             }
-            nInvalid++;
         }
 
         prevRecordId = record->id;
@@ -392,6 +429,11 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                 interruptIntervalNumBytes = 0;
             }
         }
+    }
+
+    if (results->numRemovedCorruptRecords > 0) {
+        results->warnings.push_back(str::stream() << "Removed " << results->numRemovedCorruptRecords
+                                                  << " invalid documents.");
     }
 
     const auto fastCount = _validateState->getCollection()->numRecords(opCtx);
@@ -418,7 +460,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
 }
 
 void ValidateAdaptor::validateIndexKeyCount(const IndexCatalogEntry* index,
-                                            ValidateResults& results) {
+                                            IndexValidateResults& results) {
     // Fetch the total number of index entries we previously found traversing the index.
     const IndexDescriptor* desc = index->descriptor();
     const std::string indexName = desc->indexName();

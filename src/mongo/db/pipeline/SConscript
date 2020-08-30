@@ -55,6 +55,15 @@ env.Library(
 )
 
 env.Library(
+    target='variable_validation',
+    source=[
+        "variable_validation.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+env.Library(
     target='expression_context',
     source=[
         'expression.cpp',
@@ -67,7 +76,6 @@ env.Library(
         'variables.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
@@ -81,8 +89,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/summation',
         'aggregation_request',
         'dependencies',
+        'variable_validation',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/vector_clock',
     ],
 )
@@ -155,10 +165,10 @@ env.Library(
         'sharded_agg_helpers.cpp',
     ],
     LIBDEPS=[
-        'aggregation',
         '$BUILD_DIR/mongo/s/async_requests_sender',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
         '$BUILD_DIR/mongo/s/query/cluster_query',
+        'aggregation',
     ],
 )
 
@@ -189,6 +199,7 @@ pipelineEnv.InjectThirdParty(libraries=['snappy'])
 pipelineEnv.Library(
     target='pipeline',
     source=[
+        'change_stream_document_diff_parser.cpp',
         'document_source.cpp',
         'document_source_add_fields.cpp',
         'document_source_bucket.cpp',
@@ -267,6 +278,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/sessions_collection',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
         '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/db/update/update_document_diff',
         '$BUILD_DIR/mongo/db/views/resolved_view',
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/third_party/shim_snappy',
@@ -279,6 +291,7 @@ pipelineEnv.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/sorter/sorter_idl',
         '$BUILD_DIR/mongo/rpc/command_status',
     ]
 )
@@ -381,6 +394,7 @@ env.CppUnitTest(
         'lookup_set_cache_test.cpp',
         'pipeline_metadata_tree_test.cpp',
         'pipeline_test.cpp',
+        'resharding_initial_split_policy_test.cpp',
         'resume_token_test.cpp',
         'semantic_analysis_test.cpp',
         'sequential_document_cache_test.cpp',
@@ -390,8 +404,10 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/cst/cst',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util',
+        '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
@@ -400,6 +416,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/devnull/storage_devnull_core',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/mongo/s/query/router_exec_stage',

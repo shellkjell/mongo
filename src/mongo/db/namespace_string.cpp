@@ -69,8 +69,8 @@ const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
 const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(NamespaceString::kConfigDb,
                                                                        "migrationCoordinators");
 
-const NamespaceString NamespaceString::kMigrationDonorsNamespace(NamespaceString::kConfigDb,
-                                                                 "migrationDonors");
+const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(NamespaceString::kConfigDb,
+                                                                       "tenantMigrationDonors");
 
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
@@ -85,6 +85,8 @@ const NamespaceString NamespaceString::kIndexBuildEntryNamespace(NamespaceString
                                                                  "system.indexBuilds");
 const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::kConfigDb,
                                                                "rangeDeletions");
+const NamespaceString NamespaceString::kConfigReshardingOperationsNamespace(
+    NamespaceString::kConfigDb, "reshardingOperations");
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
 const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
@@ -127,6 +129,10 @@ bool NamespaceString::isLegalClientSystemNS() const {
         return true;
     if (coll() == kSystemDotViewsCollectionName)
         return true;
+    if (isTemporaryReshardingCollection()) {
+        // Permit integration testing on resharding collections.
+        return true;
+    }
 
     return false;
 }
@@ -231,10 +237,18 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
         return true;
 
     if (ns() == "config.cache.databases" || ns() == "config.cache.collections" ||
-        (db() == "config" && coll().startsWith("cache.chunks")))
+        isConfigDotCacheDotChunks())
         return true;
 
     return false;
+}
+
+bool NamespaceString::isConfigDotCacheDotChunks() const {
+    return db() == "config" && coll().startsWith("cache.chunks.");
+}
+
+bool NamespaceString::isTemporaryReshardingCollection() const {
+    return coll().startsWith("system.resharding.");
 }
 
 bool NamespaceString::isReplicated() const {

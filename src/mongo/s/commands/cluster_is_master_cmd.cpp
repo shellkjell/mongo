@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
@@ -55,9 +56,21 @@ MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
 
 namespace {
 
-class CmdIsMaster : public BasicCommandWithReplyBuilderInterface {
+constexpr auto kHelloString = "hello"_sd;
+// Aliases for the hello command in order to provide backwards compatibility.
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
+
+class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdIsMaster() : BasicCommandWithReplyBuilderInterface("isMaster", "ismaster") {}
+    CmdHello()
+        : BasicCommandWithReplyBuilderInterface(
+              kHelloString, {kCamelCaseIsMasterString, kLowerCaseIsMasterString}) {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -88,6 +101,11 @@ public:
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
         waitInIsMaster.pauseWhileSet(opCtx);
+
+        // Parse the command name, which should be one of the following: hello, isMaster, or
+        // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+        // instead of "ismaster".
+        bool useLegacyResponseFields = (cmdObj.firstElementFieldNameStringData() != kHelloString);
 
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
@@ -157,7 +175,7 @@ public:
         auto mongosIsMasterResponse =
             mongosTopCoord->awaitIsMasterResponse(opCtx, clientTopologyVersion, deadline);
 
-        mongosIsMasterResponse->appendToBuilder(&result);
+        mongosIsMasterResponse->appendToBuilder(&result, useLegacyResponseFields);
         // The isMaster response always includes a topologyVersion.
         auto currentMongosTopologyVersion = mongosIsMasterResponse->getTopologyVersion();
 
@@ -170,8 +188,9 @@ public:
 
         // Mongos tries to keep exactly the same version range of the server for which
         // it is compiled.
-        result.append("maxWireVersion", WireSpec::instance().incomingExternalClient.maxWireVersion);
-        result.append("minWireVersion", WireSpec::instance().incomingExternalClient.minWireVersion);
+        auto wireSpec = WireSpec::instance().get();
+        result.append("maxWireVersion", wireSpec->incomingExternalClient.maxWireVersion);
+        result.append("minWireVersion", wireSpec->incomingExternalClient.minWireVersion);
 
         {
             const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
@@ -223,7 +242,7 @@ public:
         return true;
     }
 
-} isMaster;
+} hello;
 
 }  // namespace
 }  // namespace mongo

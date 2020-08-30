@@ -51,7 +51,6 @@
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/logger/logger.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
@@ -93,7 +92,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         stmtId,                        // statement id
         prevWriteOpTimeInTransaction,  // optime of previous write within same transaction
         boost::none,                   // pre-image optime
-        boost::none);                  // post-image optime
+        boost::none,                   // post-image optime
+        boost::none);                  // ShardId of resharding recipient
 }
 
 class OpObserverMock : public OpObserverNoop {
@@ -1315,6 +1315,41 @@ TEST_F(TxnParticipantTest, StashInNestedSessionIsANoop) {
         ASSERT_EQUALS(originalRecoveryUnit, opCtx()->recoveryUnit());
         ASSERT(opCtx()->getWriteUnitOfWork());
     }
+}
+
+TEST_F(TxnParticipantTest, CorrectlyStashAPIParameters) {
+    auto sessionCheckout = checkOutSession();
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    auto defaultAPIParams = txnParticipant.getAPIParameters(opCtx());
+    ASSERT_FALSE(defaultAPIParams.getAPIVersion().is_initialized());
+    ASSERT_FALSE(defaultAPIParams.getAPIStrict().is_initialized());
+    ASSERT_FALSE(defaultAPIParams.getAPIDeprecationErrors().is_initialized());
+
+    txnParticipant.unstashTransactionResources(opCtx(), "insert");
+
+    APIParameters updatedAPIParams = APIParameters();
+    updatedAPIParams.setAPIVersion("2");
+    updatedAPIParams.setAPIStrict(true);
+    updatedAPIParams.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = updatedAPIParams;
+
+    // Verify that API parameters on the opCtx were updated correctly.
+    auto opCtxAPIParams = APIParameters::get(opCtx());
+    ASSERT_EQ("2", *opCtxAPIParams.getAPIVersion());
+    ASSERT_TRUE(*opCtxAPIParams.getAPIStrict());
+    ASSERT_TRUE(*opCtxAPIParams.getAPIDeprecationErrors());
+
+    txnParticipant.stashTransactionResources(opCtx());
+
+    // Reset the API parameters on the opCtx to the default values.
+    APIParameters::get(opCtx()) = defaultAPIParams;
+
+    // Verify that 'getAPIParameters()' will return the stashed API parameters.
+    APIParameters storedAPIParams = txnParticipant.getAPIParameters(opCtx());
+    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
+    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
+    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
 }
 
 /**
@@ -2851,6 +2886,46 @@ TEST_F(TransactionsMetricsTest, ReportUnstashedResourcesForARetryableWrite) {
     ASSERT_BSONOBJ_EQ(unstashedStateBuilder.obj(), reportBuilder.obj());
 }
 
+TEST_F(TransactionsMetricsTest, UseAPIParametersOnOpCtxForARetryableWrite) {
+    ASSERT(opCtx()->lockState());
+    ASSERT(opCtx()->recoveryUnit());
+
+    APIParameters firstAPIParameters = APIParameters();
+    firstAPIParameters.setAPIVersion("2");
+    firstAPIParameters.setAPIStrict(true);
+    firstAPIParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = firstAPIParameters;
+
+    MongoDOperationContextSession opCtxSession(opCtx());
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.beginOrContinue(opCtx(), *opCtx()->getTxnNumber(), boost::none, boost::none);
+
+    APIParameters secondAPIParameters = APIParameters();
+    secondAPIParameters.setAPIVersion("3");
+    APIParameters::get(opCtx()) = secondAPIParameters;
+
+    // 'getAPIParameters()' should return the API parameters decorating opCtx if we are in a
+    // retryable write.
+    APIParameters storedAPIParameters = txnParticipant.getAPIParameters(opCtx());
+    ASSERT_EQ("3", *storedAPIParameters.getAPIVersion());
+    ASSERT_FALSE(storedAPIParameters.getAPIStrict().is_initialized());
+    ASSERT_FALSE(storedAPIParameters.getAPIDeprecationErrors().is_initialized());
+
+    // Stash secondAPIParameters.
+    txnParticipant.stashTransactionResources(opCtx());
+
+    APIParameters thirdAPIParameters = APIParameters();
+    thirdAPIParameters.setAPIVersion("4");
+    APIParameters::get(opCtx()) = thirdAPIParameters;
+
+    // 'getAPIParameters()' should still return API parameters, even if there are stashed API
+    // parameters in TxnResources.
+    storedAPIParameters = txnParticipant.getAPIParameters(opCtx());
+    ASSERT_EQ("4", *storedAPIParameters.getAPIVersion());
+    ASSERT_FALSE(storedAPIParameters.getAPIStrict().is_initialized());
+    ASSERT_FALSE(storedAPIParameters.getAPIDeprecationErrors().is_initialized());
+}
+
 namespace {
 
 /*
@@ -2974,13 +3049,20 @@ void setupAdditiveMetrics(const int metricValue, OperationContext* opCtx) {
 void buildParametersInfoString(StringBuilder* sb,
                                LogicalSessionId sessionId,
                                const TxnNumber txnNum,
+                               const APIParameters apiParameters,
                                const repl::ReadConcernArgs readConcernArgs,
                                bool autocommitVal) {
     BSONObjBuilder lsidBuilder;
     sessionId.serialize(&lsidBuilder);
     auto autocommitString = autocommitVal ? "true" : "false";
+    auto apiVersionString = apiParameters.getAPIVersion().value_or("1");
+    auto apiStrictString = apiParameters.getAPIStrict().value_or(false) ? "true" : "false";
+    auto apiDeprecationErrorsString =
+        apiParameters.getAPIDeprecationErrors().value_or(false) ? "true" : "false";
     (*sb) << "parameters:{ lsid: " << lsidBuilder.done().toString() << ", txnNumber: " << txnNum
-          << ", autocommit: " << autocommitString
+          << ", autocommit: " << autocommitString << ", apiVersion: \"" << apiVersionString
+          << "\", apiStrict: " << apiStrictString
+          << ", apiDeprecationErrors: " << apiDeprecationErrorsString
           << ", readConcern: " << readConcernArgs.toBSON().getObjectField("readConcern") << " },";
 }
 
@@ -3056,8 +3138,12 @@ std::string buildTransactionInfoString(OperationContext* opCtx,
     // In cases where we call getTransactionInfoForLogForTest after aborting a transaction
     // and check if the output matches this function's output, we must explicitly set autocommitVal
     // to true.
-    buildParametersInfoString(
-        &parametersInfo, sessionId, txnNum, repl::ReadConcernArgs::get(opCtx), autocommitVal);
+    buildParametersInfoString(&parametersInfo,
+                              sessionId,
+                              txnNum,
+                              APIParameters::get(opCtx),
+                              repl::ReadConcernArgs::get(opCtx),
+                              autocommitVal);
 
     StringBuilder readTimestampInfo;
     readTimestampInfo
@@ -3265,6 +3351,12 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterCommit) {
 
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3282,7 +3374,7 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterCommit) {
     const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
     std::string testTransactionInfo = txnParticipant.getTransactionInfoForLogForTest(
-        opCtx(), &lockerInfo->stats, true, readConcernArgs);
+        opCtx(), &lockerInfo->stats, true, apiParameters, readConcernArgs);
 
     std::string expectedTransactionInfo =
         buildTransactionInfoString(opCtx(),
@@ -3305,6 +3397,12 @@ TEST_F(TransactionsMetricsTest, TestPreparedTransactionInfoForLogAfterCommit) {
 
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3326,7 +3424,7 @@ TEST_F(TransactionsMetricsTest, TestPreparedTransactionInfoForLogAfterCommit) {
     const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
     std::string testTransactionInfo = txnParticipant.getTransactionInfoForLogForTest(
-        opCtx(), &lockerInfo->stats, true, readConcernArgs);
+        opCtx(), &lockerInfo->stats, true, apiParameters, readConcernArgs);
 
     std::string expectedTransactionInfo =
         buildTransactionInfoString(opCtx(),
@@ -3347,6 +3445,12 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterAbort) {
 
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3364,7 +3468,7 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterAbort) {
     ASSERT(lockerInfo);
 
     std::string testTransactionInfo = txnParticipant.getTransactionInfoForLogForTest(
-        opCtx(), &lockerInfo->stats, false, readConcernArgs);
+        opCtx(), &lockerInfo->stats, false, apiParameters, readConcernArgs);
 
     std::string expectedTransactionInfo =
         buildTransactionInfoString(opCtx(),
@@ -3388,6 +3492,12 @@ TEST_F(TransactionsMetricsTest, TestPreparedTransactionInfoForLogAfterAbort) {
 
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3408,7 +3518,7 @@ TEST_F(TransactionsMetricsTest, TestPreparedTransactionInfoForLogAfterAbort) {
     ASSERT(lockerInfo);
 
     std::string testTransactionInfo = txnParticipant.getTransactionInfoForLogForTest(
-        opCtx(), &lockerInfo->stats, false, readConcernArgs);
+        opCtx(), &lockerInfo->stats, false, apiParameters, readConcernArgs);
 
     std::string expectedTransactionInfo =
         buildTransactionInfoString(opCtx(),
@@ -3426,6 +3536,12 @@ TEST_F(TransactionsMetricsTest, TestPreparedTransactionInfoForLogAfterAbort) {
 DEATH_TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogWithNoLockerInfoStats, "invariant") {
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3442,13 +3558,20 @@ DEATH_TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogWithNoLockerInfoS
     txnParticipant.unstashTransactionResources(opCtx(), "commitTransaction");
     txnParticipant.commitUnpreparedTransaction(opCtx());
 
-    txnParticipant.getTransactionInfoForLogForTest(opCtx(), nullptr, true, readConcernArgs);
+    txnParticipant.getTransactionInfoForLogForTest(
+        opCtx(), nullptr, true, apiParameters, readConcernArgs);
 }
 
 TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
     auto tickSource = initMockTickSource();
 
     auto sessionCheckout = checkOutSession();
+
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
 
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
@@ -3491,7 +3614,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
     ASSERT(lockerInfo);
 
     BSONObj expected = txnParticipant.getTransactionInfoBSONForLogForTest(
-        opCtx(), &lockerInfo->stats, true, readConcernArgs);
+        opCtx(), &lockerInfo->stats, true, apiParameters, readConcernArgs);
     ASSERT_EQUALS(1, countBSONFormatLogLinesIsSubset(expected));
 }
 
@@ -3499,6 +3622,12 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowCommit) {
     auto tickSource = initMockTickSource();
 
     auto sessionCheckout = checkOutSession();
+
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
 
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
@@ -3539,7 +3668,7 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowCommit) {
     ASSERT(lockerInfo);
 
     BSONObj expected = txnParticipant.getTransactionInfoBSONForLogForTest(
-        opCtx(), &lockerInfo->stats, true, readConcernArgs);
+        opCtx(), &lockerInfo->stats, true, apiParameters, readConcernArgs);
     ASSERT_EQUALS(1, countBSONFormatLogLinesIsSubset(expected));
 }
 
@@ -3601,6 +3730,12 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
 
     auto sessionCheckout = checkOutSession();
 
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
+
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
         readConcernArgs.initialize(BSON("find"
@@ -3656,6 +3791,12 @@ TEST_F(TransactionsMetricsTest, LogPreparedTransactionInfoAfterSlowAbort) {
 TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterExceptionInPrepare) {
     auto tickSource = initMockTickSource();
     auto sessionCheckout = checkOutSession();
+
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
 
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
@@ -3714,6 +3855,12 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     auto tickSource = initMockTickSource();
 
     auto sessionCheckout = checkOutSession();
+
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("2");
+    apiParameters.setAPIStrict(true);
+    apiParameters.setAPIDeprecationErrors(true);
+    APIParameters::get(opCtx()) = apiParameters;
 
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(

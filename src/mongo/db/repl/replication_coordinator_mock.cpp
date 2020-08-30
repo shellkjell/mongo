@@ -73,7 +73,8 @@ ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service)
 
 ReplicationCoordinatorMock::~ReplicationCoordinatorMock() {}
 
-void ReplicationCoordinatorMock::startup(OperationContext* opCtx) {
+void ReplicationCoordinatorMock::startup(
+    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
     // TODO
 }
 
@@ -352,11 +353,6 @@ ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState
 
 void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*, long long) {}
 
-Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
-    MONGO_UNREACHABLE;
-    return Status::OK();
-}
-
 void ReplicationCoordinatorMock::signalUpstreamUpdater() {}
 
 StatusWith<BSONObj> ReplicationCoordinatorMock::prepareReplSetUpdatePositionCommand() const {
@@ -557,9 +553,6 @@ OpTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTime() const {
     return OpTime();
 }
 
-OpTimeAndWallTime ReplicationCoordinatorMock::getCurrentCommittedSnapshotOpTimeAndWallTime() const {
-    return OpTimeAndWallTime();
-}
 void ReplicationCoordinatorMock::waitUntilSnapshotCommitted(OperationContext* opCtx,
                                                             const Timestamp& untilSnapshot) {}
 

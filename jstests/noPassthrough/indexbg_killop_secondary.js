@@ -1,12 +1,15 @@
 /**
  * Confirms that aborting a background index builds on a secondary does not leave node in an
  * inconsistent state.
- * @tags: [requires_replication, resumable_index_build_incompatible]
+ * @tags: [requires_replication]
  */
 (function() {
 "use strict";
 
 load('jstests/noPassthrough/libs/index_build.js');
+
+// This test triggers an unclean shutdown (an fassert), which may cause inaccurate fast counts.
+TestData.skipEnforceFastCountOnValidate = true;
 
 const rst = new ReplSetTest({
     nodes: [

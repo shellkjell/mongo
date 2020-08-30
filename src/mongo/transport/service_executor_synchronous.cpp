@@ -35,9 +35,10 @@
 
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/service_entry_point_utils.h"
 #include "mongo/transport/service_executor_gen.h"
+#include "mongo/transport/service_executor_utils.h"
 #include "mongo/util/processinfo.h"
+#include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 namespace transport {
@@ -45,6 +46,14 @@ namespace {
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "passthrough"_sd;
+
+const auto getServiceExecutorSynchronous =
+    ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorSynchronous>>();
+
+const auto serviceExecutorSynchronousRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "ServiceExecutorSynchronous", [](ServiceContext* ctx) {
+        getServiceExecutorSynchronous(ctx) = std::make_unique<ServiceExecutorSynchronous>(ctx);
+    }};
 }  // namespace
 
 thread_local std::deque<ServiceExecutor::Task> ServiceExecutorSynchronous::_localWorkQueue = {};
@@ -78,7 +87,13 @@ Status ServiceExecutorSynchronous::shutdown(Milliseconds timeout) {
                  "passthrough executor couldn't shutdown all worker threads within time limit.");
 }
 
-Status ServiceExecutorSynchronous::schedule(Task task, ScheduleFlags flags) {
+ServiceExecutorSynchronous* ServiceExecutorSynchronous::get(ServiceContext* ctx) {
+    auto& ref = getServiceExecutorSynchronous(ctx);
+    invariant(ref);
+    return ref.get();
+}
+
+Status ServiceExecutorSynchronous::scheduleTask(Task task, ScheduleFlags flags) {
     if (!_stillRunning.load()) {
         return Status{ErrorCodes::ShutdownInProgress, "Executor is not running"};
     }
@@ -109,7 +124,7 @@ Status ServiceExecutorSynchronous::schedule(Task task, ScheduleFlags flags) {
         return Status::OK();
     }
 
-    // First call to schedule() for this connection, spawn a worker thread that will push jobs
+    // First call to scheduleTask() for this connection, spawn a worker thread that will push jobs
     // into the thread local job queue.
     LOGV2_DEBUG(22983, 3, "Starting new executor thread in passthrough mode");
 
@@ -140,6 +155,12 @@ void ServiceExecutorSynchronous::appendStats(BSONObjBuilder* bob) const {
     *bob << kExecutorLabel << kExecutorName << kThreadsRunning
          << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
 }
+
+void ServiceExecutorSynchronous::runOnDataAvailable(Session* session,
+                                                    OutOfLineExecutor::Task onCompletionCallback) {
+    scheduleCallbackOnDataAvailable(session, std::move(onCompletionCallback), this);
+}
+
 
 }  // namespace transport
 }  // namespace mongo

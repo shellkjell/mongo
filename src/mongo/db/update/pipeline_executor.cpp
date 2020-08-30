@@ -35,6 +35,7 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/pipeline/document_source_queue.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/storage_validation.h"
@@ -62,7 +63,7 @@ PipelineExecutor::PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>
     if (constants) {
         for (auto&& constElem : *constants) {
             const auto constName = constElem.fieldNameStringData();
-            Variables::validateNameForUserRead(constName);
+            variableValidation::validateNameForUserRead(constName);
 
             auto varId = _expCtx->variablesParseState.defineVariable(constName);
             _expCtx->variables.setConstantValue(varId, Value(constElem));
@@ -106,8 +107,10 @@ UpdateExecutor::ApplyResult PipelineExecutor::applyUpdate(ApplyParams applyParam
 
     if (applyParams.logMode != ApplyParams::LogMode::kDoNotGenerateOplogEntry && !ret.noop) {
         if (applyParams.logMode == ApplyParams::LogMode::kGenerateOplogEntry) {
-            // We're allowed to generate $v: 2 log entries.
-            const auto diff = doc_diff::computeDiff(originalDoc, transformedDoc);
+            // We're allowed to generate $v: 2 log entries. The $v:2 has certain meta-fields like
+            // '$v', 'diff'. So we pad some additional byte while computing diff.
+            const auto diff = doc_diff::computeDiff(
+                originalDoc, transformedDoc, update_oplog_entry::kSizeOfDeltaOplogEntryMetadata);
             if (diff) {
                 ret.oplogEntry = update_oplog_entry::makeDeltaOplogEntry(*diff);
                 return ret;

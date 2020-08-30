@@ -100,7 +100,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                             statementId,                      // statement id
                             boost::none,   // optime of previous write within same transaction
                             boost::none,   // pre-image optime
-                            boost::none);  // post-image optime
+                            boost::none,   // post-image optime
+                            boost::none);  // ShardId of resharding recipient
 }
 
 /**
@@ -162,7 +163,15 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
 
                 WriteUnitOfWork wuow(opCtx);
                 opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
-                    opCtx, _ns, {}, {}, message);
+                    opCtx,
+                    _ns,
+                    {},
+                    {},
+                    message,
+                    boost::none,
+                    boost::none,
+                    boost::none,
+                    boost::none);
                 wuow.commit();
             });
     }

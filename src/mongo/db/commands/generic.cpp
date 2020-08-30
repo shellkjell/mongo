@@ -35,7 +35,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/util/ramlog.h"
 
 #include <sstream>
 #include <string>
@@ -51,6 +50,10 @@ using std::vector;
 class PingCommand : public BasicCommand {
 public:
     PingCommand() : BasicCommand("ping") {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -180,6 +183,8 @@ public:
             if (c->secondaryAllowed(opCtx->getServiceContext()) ==
                 Command::AllowedOnSecondary::kOptIn)
                 temp.append("slaveOverrideOk", true);
+            temp.append("apiVersions", c->apiVersions());
+            temp.append("deprecatedApiVersions", c->deprecatedApiVersions());
             temp.done();
         }
         b.done();

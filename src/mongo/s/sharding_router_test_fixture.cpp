@@ -169,11 +169,12 @@ ShardingTestFixture::ShardingTestFixture()
 
     CatalogCacheLoader::set(service, std::make_unique<ConfigServerCatalogCacheLoader>());
 
+    auto catalogCache = std::make_unique<CatalogCache>(service, CatalogCacheLoader::get(service));
     // For now initialize the global grid object. All sharding objects will be accessible from there
     // until we get rid of it.
     auto const grid = Grid::get(operationContext());
     grid->init(makeShardingCatalogClient(std::move(uniqueDistLockManager)),
-               std::make_unique<CatalogCache>(CatalogCacheLoader::get(service)),
+               std::move(catalogCache),
                std::move(shardRegistry),
                std::make_unique<ClusterCursorManager>(service->getPreciseClockSource()),
                std::make_unique<BalancerConfiguration>(),
@@ -187,8 +188,18 @@ ShardingTestFixture::ShardingTestFixture()
 
 ShardingTestFixture::~ShardingTestFixture() {
     CatalogCacheLoader::clearForTests(getServiceContext());
-    if (Grid::get(getServiceContext()) && Grid::get(getServiceContext())->getExecutorPool()) {
-        Grid::get(getServiceContext())->getExecutorPool()->shutdownAndJoin();
+
+    if (auto grid = Grid::get(getServiceContext())) {
+        if (grid->getExecutorPool()) {
+            grid->getExecutorPool()->shutdownAndJoin();
+        }
+        if (grid->catalogClient()) {
+            grid->catalogClient()->shutDown(operationContext());
+        }
+        if (grid->shardRegistry()) {
+            grid->shardRegistry()->shutdown();
+        }
+        grid->clearForUnitTests();
     }
 }
 

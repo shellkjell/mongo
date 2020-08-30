@@ -230,7 +230,7 @@ void UpsertStage::_generateNewDocumentFromUpdateOp(const FieldRefSet& immutableP
     const bool validateForStorage = false;
     const bool isInsert = true;
     uassertStatusOK(
-        _params.driver->update({}, &_doc, validateForStorage, immutablePaths, isInsert));
+        _params.driver->update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
 };
 
 void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths) {
@@ -247,7 +247,7 @@ void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutab
     UpdateDriver replacementDriver(nullptr);
 
     // Create a new replacement-style update from the supplied document.
-    replacementDriver.parse({suppliedDoc}, {});
+    replacementDriver.parse(write_ops::UpdateModification::parseFromClassicUpdate(suppliedDoc), {});
     replacementDriver.setLogOp(false);
 
     // We do not validate for storage, as we will validate the full document before inserting.
@@ -255,7 +255,7 @@ void UpsertStage::_generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutab
     const bool validateForStorage = false;
     const bool isInsert = true;
     uassertStatusOK(
-        replacementDriver.update({}, &_doc, validateForStorage, immutablePaths, isInsert));
+        replacementDriver.update(opCtx(), {}, &_doc, validateForStorage, immutablePaths, isInsert));
 }
 
 void UpsertStage::_assertDocumentToBeInsertedIsValid(const mb::Document& document,

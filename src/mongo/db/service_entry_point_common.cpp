@@ -70,12 +70,14 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
@@ -514,6 +516,17 @@ void _abortUnpreparedOrStashPreparedTransaction(
 }
 }  // namespace
 
+void invokeWithNoSession(OperationContext* opCtx,
+                         const OpMsgRequest& request,
+                         CommandInvocation* invocation,
+                         rpc::ReplyBuilderInterface* replyBuilder) {
+    tenant_migration_donor::checkIfCanReadOrBlock(opCtx, request.getDatabase());
+    tenant_migration_donor::migrationConflictRetry(
+        opCtx,
+        [&] { CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder); },
+        replyBuilder);
+}
+
 void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  const OpMsgRequest& request,
                                  CommandInvocation* invocation,
@@ -615,8 +628,16 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         }
     }
 
+    tenant_migration_donor::checkIfCanReadOrBlock(opCtx, request.getDatabase());
+
+    // Use the API parameters that were stored when the transaction was initiated.
+    APIParameters::get(opCtx) = txnParticipant.getAPIParameters(opCtx);
+
     try {
-        CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+        tenant_migration_donor::migrationConflictRetry(
+            opCtx,
+            [&] { CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder); },
+            replyBuilder);
     } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>&) {
         // Exceptions are used to resolve views in a sharded cluster, so they should be handled
         // specially to avoid unnecessary aborts.
@@ -802,7 +823,7 @@ bool runCommandImpl(OperationContext* opCtx,
                 invokeWithSessionCheckedOut(
                     opCtx, request, invocation, sessionOptions, replyBuilder);
             } else {
-                CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+                invokeWithNoSession(opCtx, request, invocation, replyBuilder);
             }
         } catch (const DBException& ex) {
             // Do no-op write before returning NoSuchTransaction if command has writeConcern.
@@ -833,30 +854,34 @@ bool runCommandImpl(OperationContext* opCtx,
         if (shouldCheckOutSession) {
             invokeWithSessionCheckedOut(opCtx, request, invocation, sessionOptions, replyBuilder);
         } else {
-            CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+            invokeWithNoSession(opCtx, request, invocation, replyBuilder);
         }
     }
 
     // This fail point blocks all commands which are running on the specified namespace, or which
     // are present in the given list of commands.If no namespace or command list are provided,then
     // the failpoint will block all commands.
-    waitAfterCommandFinishesExecution.execute([&](const BSONObj& data) {
-        auto ns = data["ns"].valueStringDataSafe();
-        auto commands =
-            data.hasField("commands") ? data["commands"].Array() : std::vector<BSONElement>();
-
-        // If 'ns' or 'commands' is not set, block for all the namespaces or commands respectively.
-        if ((ns.empty() || invocation->ns().ns() == ns) &&
-            (commands.empty() ||
-             std::any_of(commands.begin(), commands.end(), [&request](auto& element) {
-                 return element.valueStringDataSafe() == request.getCommandName();
-             }))) {
+    waitAfterCommandFinishesExecution.executeIf(
+        [&](const BSONObj& data) {
             CurOpFailpointHelpers::waitWhileFailPointEnabled(
                 &waitAfterCommandFinishesExecution, opCtx, "waitAfterCommandFinishesExecution");
-        }
-    });
+        },
+        [&](const BSONObj& data) {
+            auto ns = data["ns"].valueStringDataSafe();
+            auto commands =
+                data.hasField("commands") ? data["commands"].Array() : std::vector<BSONElement>();
+
+            // If 'ns' or 'commands' is not set, block for all the namespaces or commands
+            // respectively.
+            return (ns.empty() || invocation->ns().ns() == ns) &&
+                (commands.empty() ||
+                 std::any_of(commands.begin(), commands.end(), [&request](auto& element) {
+                     return element.valueStringDataSafe() == request.getCommandName();
+                 }));
+        });
 
     behaviors.waitForLinearizableReadConcern(opCtx);
+    tenant_migration_donor::checkIfLinearizableReadWasAllowedOrThrow(opCtx, request.getDatabase());
 
     // Wait for data to satisfy the read concern level, if necessary.
     behaviors.waitForSpeculativeMajorityReadConcern(opCtx);
@@ -914,9 +939,21 @@ void execCommandDatabase(OperationContext* opCtx,
         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
 
     try {
+        const auto apiParamsFromClient = initializeAPIParameters(opCtx, request.body, command);
+        Client* client = opCtx->getClient();
+
         {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            stdx::lock_guard<Client> lk(*client);
             CurOp::get(opCtx)->setCommand_inlock(command);
+            APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+        }
+
+        auto& apiParams = APIParameters::get(opCtx);
+        auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
+        const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+        if (clientMetadata) {
+            auto appName = clientMetadata.get().getApplicationName().toString();
+            apiVersionMetrics.update(appName, apiParams);
         }
 
         sleepMillisAfterCommandExecutionBegins.execute([&](const BSONObj& data) {
@@ -933,16 +970,12 @@ void execCommandDatabase(OperationContext* opCtx,
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
 
-        auto const apiParamsFromClient = initializeAPIParameters(request.body);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
-
         sessionOptions = initializeOperationSessionInfo(
             opCtx,
             request.body,
             command->requiresAuth(),
             command->attachLogicalSessionsToOpCtx(),
-            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet);
 
         CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
 
@@ -1076,12 +1109,17 @@ void execCommandDatabase(OperationContext* opCtx,
         int maxTimeMS = uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
         int maxTimeMSOpOnly = uassertStatusOK(QueryRequest::parseMaxTimeMS(maxTimeMSOpOnlyField));
 
+        // The "hello" command should not inherit the deadline from the user op it is operating as a
+        // part of as that can interfere with replica set monitoring and host selection.
+        bool ignoreMaxTimeMSOpOnly = command->getName() == "hello"_sd;
+
         if ((maxTimeMS > 0 || maxTimeMSOpOnly > 0) &&
             command->getLogicalOp() != LogicalOp::opGetMore) {
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            if (maxTimeMSOpOnly > 0 && (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
+            if (!ignoreMaxTimeMSOpOnly && maxTimeMSOpOnly > 0 &&
+                (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
                 opCtx->storeMaxTimeMS(Milliseconds{maxTimeMS});
                 opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMSOpOnly},
                                              ErrorCodes::MaxTimeMSExpired);
@@ -1121,6 +1159,13 @@ void execCommandDatabase(OperationContext* opCtx,
         if (startTransaction) {
             opCtx->lockState()->setSharedLocksShouldTwoPhaseLock(true);
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
+        }
+
+        if (opCtx->inMultiDocumentTransaction() && !startTransaction) {
+            uassert(4937700,
+                    "API parameters are only allowed in the first command of a multi-document "
+                    "transaction",
+                    !APIParameters::get(opCtx).getParamsPassed());
         }
 
         // Remember whether or not this operation is starting a transaction, in case something
@@ -1345,7 +1390,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
             const auto session = opCtx->getClient()->session();
             if (session) {
-                if (!opCtx->isExhaust() || c->getName() != "isMaster"_sd) {
+                if (!opCtx->isExhaust() || c->getName() != "hello"_sd) {
                     InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
                 }
             }
@@ -1633,9 +1678,9 @@ BSONObj ServiceEntryPointCommon::getRedactedCopyForLogging(const Command* comman
     return bob.obj();
 }
 
-DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
-                                                  const Message& m,
-                                                  const Hooks& behaviors) {
+Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
+                                                          const Message& m,
+                                                          const Hooks& behaviors) noexcept try {
     // before we lock...
     NetworkOp op = m.operation();
     bool isCommand = false;
@@ -1685,9 +1730,8 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
-        // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
-        if (auto command = currentOp.getCommand();
-            command && (command->getName() == "ismaster" || command->getName() == "isMaster")) {
+        // Hello should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        if (auto command = currentOp.getCommand(); command && (command->getName() == "hello")) {
             slowMsOverride =
                 2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
         }
@@ -1778,7 +1822,10 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     }
 
     recordCurOpMetrics(opCtx);
-    return dbresponse;
+    return Future<DbResponse>::makeReady(std::move(dbresponse));
+} catch (const DBException& e) {
+    LOGV2_ERROR(4879802, "Failed to handle request", "error"_attr = redact(e));
+    return e.toStatus();
 }
 
 ServiceEntryPointCommon::Hooks::~Hooks() = default;

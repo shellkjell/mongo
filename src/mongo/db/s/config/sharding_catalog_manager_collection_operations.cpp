@@ -89,6 +89,7 @@ MONGO_FAIL_POINT_DEFINE(hangRefineCollectionShardKeyBeforeCommit);
 namespace {
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
+static constexpr int kMaxNumStaleShardVersionRetries = 10;
 const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
 const char kWriteConcernField[] = "writeConcern";
 
@@ -151,7 +152,7 @@ Status updateConfigDocumentInTxn(OperationContext* opCtx,
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(query);
-            entry.setU(update);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
             entry.setUpsert(upsert);
             entry.setMulti(useMultiUpdate);
             return entry;
@@ -177,6 +178,7 @@ Status updateConfigDocumentInTxn(OperationContext* opCtx,
             ->getServiceEntryPoint()
             ->handleRequest(opCtx,
                             OpMsgRequest::fromDBAndBody(nss.db().toString(), cmdObj).serialize())
+            .get()
             .response);
 
     return getStatusFromCommandResult(replyOpMsg.body);
@@ -202,6 +204,17 @@ Status updateShardingCatalogEntryForCollectionInTxn(OperationContext* opCtx,
 }
 
 Status commitTxnForConfigDocument(OperationContext* opCtx, TxnNumber txnNumber) {
+    // Swap out the clients in order to get a fresh opCtx. Previous operations in this transaction
+    // that have been run on this opCtx would have set the timeout in the locker on the opCtx, but
+    // commit should not have a lock timeout.
+    auto newClient = getGlobalServiceContext()->makeClient("commitRefineShardKey");
+    AlternativeClientRegion acr(newClient);
+    auto commitOpCtx = cc().makeOperationContext();
+    AuthorizationSession::get(commitOpCtx.get()->getClient())
+        ->grantInternalAuthorization(commitOpCtx.get()->getClient());
+    commitOpCtx.get()->setLogicalSessionId(opCtx->getLogicalSessionId().get());
+    commitOpCtx.get()->setTxnNumber(txnNumber);
+
     BSONObjBuilder bob;
     bob.append("commitTransaction", true);
     bob.append("autocommit", false);
@@ -209,21 +222,26 @@ Status commitTxnForConfigDocument(OperationContext* opCtx, TxnNumber txnNumber) 
     bob.append(WriteConcernOptions::kWriteConcernField, WriteConcernOptions::Majority);
 
     BSONObjBuilder lsidBuilder(bob.subobjStart("lsid"));
-    opCtx->getLogicalSessionId()->serialize(&bob);
+    commitOpCtx->getLogicalSessionId()->serialize(&bob);
     lsidBuilder.doneFast();
 
     const auto cmdObj = bob.obj();
 
     const auto replyOpMsg =
-        OpMsg::parseOwned(opCtx->getServiceContext()
+        OpMsg::parseOwned(commitOpCtx->getServiceContext()
                               ->getServiceEntryPoint()
-                              ->handleRequest(opCtx,
+                              ->handleRequest(commitOpCtx.get(),
                                               OpMsgRequest::fromDBAndBody(
                                                   NamespaceString::kAdminDb.toString(), cmdObj)
                                                   .serialize())
+                              .get()
                               .response);
 
-    return getStatusFromCommandResult(replyOpMsg.body);
+    auto commandStatus = getStatusFromCommandResult(replyOpMsg.body);
+    if (!commandStatus.isOK()) {
+        return commandStatus;
+    }
+    return getWriteConcernStatusFromCommandResult(replyOpMsg.body);
 }
 
 void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const NamespaceString& nss) {
@@ -315,36 +333,57 @@ void sendDropCollectionToAllShards(OperationContext* opCtx, const NamespaceStrin
                            opCtx->getWriteConcern().toBSON());
         }
 
+        auto ignoredShardVersion = ChunkVersion::IGNORED();
+        ignoredShardVersion.setToThrowSSVOnIgnored();
+        ignoredShardVersion.appendToCommand(&builder);
         return builder.obj();
     }();
 
     auto* const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
     for (const auto& shardEntry : allShards) {
-        const auto& shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
+        bool keepTrying;
+        size_t numStaleShardVersionAttempts = 0;
+        do {
+            const auto& shard =
+                uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
 
-        auto swDropResult = shard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            nss.db().toString(),
-            dropCommandBSON,
-            Shard::RetryPolicy::kIdempotent);
+            auto swDropResult = shard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                nss.db().toString(),
+                dropCommandBSON,
+                Shard::RetryPolicy::kIdempotent);
 
-        const std::string dropCollectionErrMsg = str::stream()
-            << "Error dropping collection on shard " << shardEntry.getName();
+            const std::string dropCollectionErrMsg = str::stream()
+                << "Error dropping collection on shard " << shardEntry.getName();
 
-        auto dropResult = uassertStatusOKWithContext(swDropResult, dropCollectionErrMsg);
-        uassertStatusOKWithContext(dropResult.writeConcernStatus, dropCollectionErrMsg);
+            auto dropResult = uassertStatusOKWithContext(swDropResult, dropCollectionErrMsg);
+            uassertStatusOKWithContext(dropResult.writeConcernStatus, dropCollectionErrMsg);
 
-        auto dropCommandStatus = std::move(dropResult.commandStatus);
-        if (dropCommandStatus.code() == ErrorCodes::NamespaceNotFound) {
-            // The dropCollection command on the shard is not idempotent, and can return
-            // NamespaceNotFound. We can ignore NamespaceNotFound since we have already asserted
-            // that there is no writeConcern error.
-            continue;
-        }
+            auto dropCommandStatus = std::move(dropResult.commandStatus);
 
-        uassertStatusOKWithContext(dropCommandStatus, dropCollectionErrMsg);
+            if (dropCommandStatus.code() == ErrorCodes::NamespaceNotFound) {
+                // The dropCollection command on the shard is not idempotent, and can return
+                // NamespaceNotFound. We can ignore NamespaceNotFound since we have already asserted
+                // that there is no writeConcern error.
+                keepTrying = false;
+            } else if (ErrorCodes::isStaleShardVersionError(dropCommandStatus.code())) {
+                numStaleShardVersionAttempts++;
+                if (numStaleShardVersionAttempts == kMaxNumStaleShardVersionRetries) {
+                    uassertStatusOKWithContext(dropCommandStatus,
+                                               str::stream() << dropCollectionErrMsg
+                                                             << " due to exceeded retry attempts");
+                }
+                // No need to refresh cache, the command was sent with ChunkVersion::IGNORED and the
+                // shard is allowed to throw, which means that the drop will serialize behind a
+                // refresh.
+                keepTrying = true;
+            } else {
+                uassertStatusOKWithContext(dropCommandStatus, dropCollectionErrMsg);
+                keepTrying = false;
+            }
+        } while (keepTrying);
     }
 }
 
@@ -678,6 +717,7 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
             hangRefineCollectionShardKeyBeforeCommit.pauseWhileSet(opCtx);
         }
 
+        // Note this will wait for majority write concern.
         uassertStatusOK(commitTxnForConfigDocument(asr.opCtx(), txnNumber));
     }
 

@@ -35,6 +35,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
@@ -285,6 +286,10 @@ class CmdInsert final : public WriteCommand {
 public:
     CmdInsert() : WriteCommand("insert") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
 private:
     class Invocation final : public InvocationBase {
     public:
@@ -329,17 +334,25 @@ private:
 
 class CmdUpdate final : public WriteCommand {
 public:
-    CmdUpdate() : WriteCommand("update") {}
+    CmdUpdate() : WriteCommand("update"), _updateMetrics{"update"} {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
 private:
     class Invocation final : public InvocationBase {
     public:
-        Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
+        Invocation(const WriteCommand* cmd,
+                   const OpMsgRequest& request,
+                   UpdateMetrics* updateMetrics)
             : InvocationBase(cmd, request),
               _batch(UpdateOp::parse(request)),
-              _commandObj(request.body) {
+              _commandObj(request.body),
+              _updateMetrics{updateMetrics} {
 
             invariant(_commandObj.isOwned());
+            invariant(_updateMetrics);
 
             // Extend the lifetime of `updates` to allow asynchronous mirroring.
             if (auto seq = request.getSequence("updates"_sd); seq && !seq->objs.empty()) {
@@ -399,14 +412,22 @@ private:
                            std::move(reply),
                            &result);
 
-            // If this was a pipeline style update, record which stages were being used.
+            // Collect metrics.
             for (auto&& update : _batch.getUpdates()) {
+                // If this was a pipeline style update, record that pipeline-style was used and
+                // which stages were being used.
                 auto& updateMod = update.getU();
                 if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
                     AggregationRequest request(_batch.getNamespace(),
                                                updateMod.getUpdatePipeline());
                     LiteParsedPipeline pipeline(request);
                     pipeline.tickGlobalStageCounters();
+                    _updateMetrics->incrementExecutedWithAggregationPipeline();
+                }
+
+                // If this command had arrayFilters option, record that it was used.
+                if (update.getArrayFilters()) {
+                    _updateMetrics->incrementExecutedWithArrayFilters();
                 }
             }
         }
@@ -448,10 +469,13 @@ private:
 
         // Holds a shared pointer to the first entry in `updates` array.
         BSONObj _updateOpObj;
+
+        // Update related command execution metrics.
+        UpdateMetrics* const _updateMetrics;
     };
 
     std::unique_ptr<CommandInvocation> parse(OperationContext*, const OpMsgRequest& request) {
-        return std::make_unique<Invocation>(this, request);
+        return std::make_unique<Invocation>(this, request, &_updateMetrics);
     }
 
     void snipForLogging(mutablebson::Document* cmdObj) const final {
@@ -461,17 +485,25 @@ private:
     std::string help() const final {
         return "update documents";
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } cmdUpdate;
 
 class CmdDelete final : public WriteCommand {
 public:
     CmdDelete() : WriteCommand("delete") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
 private:
     class Invocation final : public InvocationBase {
     public:
         Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
             : InvocationBase(cmd, request), _batch(DeleteOp::parse(request)) {}
+
 
     private:
         NamespaceString ns() const override {

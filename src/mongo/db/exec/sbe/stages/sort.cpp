@@ -34,6 +34,15 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/util/str.h"
 
+namespace {
+std::string nextFileName() {
+    static mongo::AtomicWord<unsigned> sortExecutorFileCounter;
+    return "extsort-sort-sbe." + std::to_string(sortExecutorFileCounter.fetchAndAdd(1));
+}
+}  // namespace
+
+#include "mongo/db/sorter/sorter.cpp"
+
 namespace mongo {
 namespace sbe {
 SortStage::SortStage(std::unique_ptr<PlanStage> input,
@@ -41,46 +50,55 @@ SortStage::SortStage(std::unique_ptr<PlanStage> input,
                      std::vector<value::SortDirection> dirs,
                      value::SlotVector vals,
                      size_t limit,
+                     size_t memoryLimit,
+                     bool allowDiskUse,
                      TrialRunProgressTracker* tracker)
     : PlanStage("sort"_sd),
       _obs(std::move(obs)),
       _dirs(std::move(dirs)),
       _vals(std::move(vals)),
       _limit(limit),
-      _st(value::MaterializedRowComparator{_dirs}),
+      _memoryLimit(memoryLimit),
+      _allowDiskUse(allowDiskUse),
+      _mergeData({0, 0}),
       _tracker(tracker) {
     _children.emplace_back(std::move(input));
 
     invariant(_obs.size() == _dirs.size());
 }
 
+SortStage ::~SortStage() {}
+
 std::unique_ptr<PlanStage> SortStage::clone() const {
-    return std::make_unique<SortStage>(_children[0]->clone(), _obs, _dirs, _vals, _limit, _tracker);
+    return std::make_unique<SortStage>(
+        _children[0]->clone(), _obs, _dirs, _vals, _limit, _memoryLimit, _allowDiskUse, _tracker);
 }
 
 void SortStage::prepare(CompileCtx& ctx) {
     _children[0]->prepare(ctx);
 
-    value::SlotSet dupCheck;
-
     size_t counter = 0;
     // Process order by fields.
     for (auto& slot : _obs) {
-        auto [it, inserted] = dupCheck.insert(slot);
-        uassert(4822812, str::stream() << "duplicate field: " << slot, inserted);
-
         _inKeyAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
-        _outAccessors.emplace(slot, std::make_unique<SortKeyAccessor>(_stIt, counter++));
+        auto [it, inserted] =
+            _outAccessors.emplace(slot,
+                                  std::make_unique<value::MaterializedRowKeyAccessor<SorterData*>>(
+                                      _mergeDataIt, counter));
+        ++counter;
+        uassert(4822812, str::stream() << "duplicate field: " << slot, inserted);
     }
 
     counter = 0;
     // Process value fields.
     for (auto& slot : _vals) {
-        auto [it, inserted] = dupCheck.insert(slot);
-        uassert(4822813, str::stream() << "duplicate field: " << slot, inserted);
-
         _inValueAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
-        _outAccessors.emplace(slot, std::make_unique<SortValueAccessor>(_stIt, counter++));
+        auto [it, inserted] = _outAccessors.emplace(
+            slot,
+            std::make_unique<value::MaterializedRowValueAccessor<SorterData*>>(_mergeDataIt,
+                                                                               counter));
+        ++counter;
+        uassert(4822813, str::stream() << "duplicate field: " << slot, inserted);
     }
 }
 
@@ -92,32 +110,58 @@ value::SlotAccessor* SortStage::getAccessor(CompileCtx& ctx, value::SlotId slot)
     return ctx.getAccessor(slot);
 }
 
+void SortStage::makeSorter() {
+    SortOptions opts;
+    opts.tempDir = storageGlobalParams.dbpath + "/_tmp";
+    opts.maxMemoryUsageBytes = _memoryLimit;
+    opts.extSortAllowed = _allowDiskUse;
+    opts.limit = _limit != std::numeric_limits<size_t>::max() ? _limit : 0;
+
+    auto comp = [&](const SorterData& lhs, const SorterData& rhs) {
+        auto size = lhs.first.size();
+        auto& left = lhs.first;
+        auto& right = rhs.first;
+        for (size_t idx = 0; idx < size; ++idx) {
+            auto [lhsTag, lhsVal] = left.getViewOfValue(idx);
+            auto [rhsTag, rhsVal] = right.getViewOfValue(idx);
+            auto [tag, val] = value::compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
+
+            auto result = value::bitcastTo<int32_t>(val);
+            if (result) {
+                return _dirs[idx] == value::SortDirection::Descending ? -result : result;
+            }
+        }
+
+        return 0;
+    };
+
+    _sorter.reset(Sorter<value::MaterializedRow, value::MaterializedRow>::make(opts, comp, {}));
+    _mergeIt.reset();
+}
+
 void SortStage::open(bool reOpen) {
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
-    value::MaterializedRow keys;
-    value::MaterializedRow vals;
+    makeSorter();
 
     while (_children[0]->getNext() == PlanState::ADVANCED) {
-        keys._fields.reserve(_inKeyAccessors.size());
-        vals._fields.reserve(_inValueAccessors.size());
+        value::MaterializedRow keys{_inKeyAccessors.size()};
+        value::MaterializedRow vals{_inValueAccessors.size()};
 
+        size_t idx = 0;
         for (auto accesor : _inKeyAccessors) {
-            keys._fields.push_back(value::OwnedValueAccessor{});
             auto [tag, val] = accesor->copyOrMoveValue();
-            keys._fields.back().reset(true, tag, val);
-        }
-        for (auto accesor : _inValueAccessors) {
-            vals._fields.push_back(value::OwnedValueAccessor{});
-            auto [tag, val] = accesor->copyOrMoveValue();
-            vals._fields.back().reset(true, tag, val);
+            keys.reset(idx++, true, tag, val);
         }
 
-        _st.emplace(std::move(keys), std::move(vals));
-        if (_st.size() - 1 == _limit) {
-            _st.erase(--_st.end());
+        idx = 0;
+        for (auto accesor : _inValueAccessors) {
+            auto [tag, val] = accesor->copyOrMoveValue();
+            vals.reset(idx++, true, tag, val);
         }
+
+        _sorter->emplace(std::move(keys), std::move(vals));
 
         if (_tracker && _tracker->trackProgress<TrialRunProgressTracker::kNumResults>(1)) {
             // If we either hit the maximum number of document to return during the trial run, or
@@ -134,28 +178,26 @@ void SortStage::open(bool reOpen) {
         }
     }
 
-    _children[0]->close();
+    _mergeIt.reset(_sorter->done());
 
-    _stIt = _st.end();
+    _children[0]->close();
 }
 
 PlanState SortStage::getNext() {
-    if (_stIt == _st.end()) {
-        _stIt = _st.begin();
-    } else {
-        ++_stIt;
-    }
+    // When the sort spilled data to disk then read back the sorted runs.
+    if (_mergeIt && _mergeIt->more()) {
+        _mergeData = _mergeIt->next();
 
-    if (_stIt == _st.end()) {
+        return trackPlanState(PlanState::ADVANCED);
+    } else {
         return trackPlanState(PlanState::IS_EOF);
     }
-
-    return trackPlanState(PlanState::ADVANCED);
 }
 
 void SortStage::close() {
     _commonStats.closes++;
-    _st.clear();
+    _mergeIt.reset();
+    _sorter.reset();
 }
 
 std::unique_ptr<PlanStageStats> SortStage::getStats() const {

@@ -102,7 +102,8 @@ public:
 
     // ================== Members of public ReplicationCoordinator API ===================
 
-    virtual void startup(OperationContext* opCtx) override;
+    virtual void startup(OperationContext* opCtx,
+                         LastStorageEngineShutdownState lastStorageEngineShutdownState) override;
 
     virtual void enterTerminalShutdown() override;
 
@@ -214,8 +215,6 @@ public:
     virtual void signalDrainComplete(OperationContext* opCtx,
                                      long long termWhenBufferIsEmpty) override;
 
-    virtual Status waitForDrainFinish(Milliseconds timeout) override;
-
     virtual void signalUpstreamUpdater() override;
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
@@ -319,8 +318,6 @@ public:
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
-
-    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;
@@ -898,12 +895,6 @@ private:
     OpTime _getCurrentCommittedSnapshotOpTime_inlock() const;
 
     /**
-     * Returns the OpTime and corresponding wall clock time of the current committed snapshot, if
-     * one exists.
-     */
-    OpTimeAndWallTime _getCurrentCommittedSnapshotOpTimeAndWallTime_inlock() const;
-
-    /**
      *  Verifies that ReadConcernArgs match node's readConcern.
      */
     Status _validateReadConcern(OperationContext* opCtx, const ReadConcernArgs& readConcern);
@@ -1089,8 +1080,12 @@ private:
      * was no local config at all or it was invalid in some way, and false if there was a valid
      * config detected but more work is needed to set it as the local config (which will be
      * handled by the callback to _finishLoadLocalConfig).
+     *
+     * Increments the rollback ID if the lastStorageEngineShutdownState indicates that the server
+     * was shut down uncleanly.
      */
-    bool _startLoadLocalConfig(OperationContext* opCtx);
+    bool _startLoadLocalConfig(OperationContext* opCtx,
+                               LastStorageEngineShutdownState lastStorageEngineShutdownState);
 
     /**
      * Callback that finishes the work started in _startLoadLocalConfig and sets _rsConfigState
@@ -1335,7 +1330,7 @@ private:
      *
      * Returns true if the value was updated to `newCommittedSnapshot`.
      */
-    bool _updateCommittedSnapshot(WithLock lk, const OpTimeAndWallTime& newCommittedSnapshot);
+    bool _updateCommittedSnapshot(WithLock lk, const OpTime& newCommittedSnapshot);
 
     /**
      * A helper method that returns the current stable optime based on the current commit point.
@@ -1595,15 +1590,14 @@ private:
     std::shared_ptr<InitialSyncer>
         _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
-    // The non-null OpTimeAndWallTime and SnapshotName of the current snapshot used for committed
-    // reads, if there is one.
+    // The non-null OpTime used for committed reads, if there is one.
     // When engaged, this must be <= _lastCommittedOpTime.
-    boost::optional<OpTimeAndWallTime> _currentCommittedSnapshot;  // (M)
+    boost::optional<OpTime> _currentCommittedSnapshot;  // (M)
 
     // A flag that enables/disables advancement of the stable timestamp for storage.
     bool _shouldSetStableTimestamp = true;  // (M)
 
-    // Used to signal threads that are waiting for new committed snapshots.
+    // Used to signal threads that are waiting for a new value of _currentCommittedSnapshot.
     stdx::condition_variable _currentCommittedSnapshotCond;  // (M)
 
     // Callback Handle used to cancel a scheduled LivenessTimeout callback.

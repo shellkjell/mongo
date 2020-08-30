@@ -168,6 +168,14 @@ public:
         getOpTimeAndWallTimeBase().setWallClockTime(std::move(value));
     }
 
+    void setDestinedRecipient(boost::optional<ShardId> value) {
+        getDurableReplOperation().setDestinedRecipient(std::move(value));
+    }
+
+    const boost::optional<ShardId>& getDestinedRecipient() const {
+        return getDurableReplOperation().getDestinedRecipient();
+    }
+
     /**
      * Sets the OpTime of the oplog entry.
      */
@@ -195,8 +203,10 @@ class OplogEntry : private MutableOplogEntry {
 public:
     // Make field names accessible.
     using MutableOplogEntry::k_idFieldName;
+    using MutableOplogEntry::kDestinedRecipientFieldName;
     using MutableOplogEntry::kDurableReplOperationFieldName;
     using MutableOplogEntry::kFromMigrateFieldName;
+    using MutableOplogEntry::kFromTenantMigrationFieldName;
     using MutableOplogEntry::kHashFieldName;
     using MutableOplogEntry::kNssFieldName;
     using MutableOplogEntry::kObject2FieldName;
@@ -219,8 +229,10 @@ public:
 
     // Make serialize() and getters accessible.
     using MutableOplogEntry::get_id;
+    using MutableOplogEntry::getDestinedRecipient;
     using MutableOplogEntry::getDurableReplOperation;
     using MutableOplogEntry::getFromMigrate;
+    using MutableOplogEntry::getFromTenantMigration;
     using MutableOplogEntry::getHash;
     using MutableOplogEntry::getNss;
     using MutableOplogEntry::getObject;
@@ -289,7 +301,8 @@ public:
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
                const boost::optional<OpTime>& preImageOpTime,
-               const boost::optional<OpTime>& postImageOpTime);
+               const boost::optional<OpTime>& postImageOpTime,
+               const boost::optional<ShardId>& destinedRecipient);
 
     // DEPRECATED: This constructor can throw. Use static parse method instead.
     explicit OplogEntry(BSONObj raw);
@@ -350,10 +363,16 @@ public:
     bool isSingleOplogEntryTransactionWithCommand() const;
 
     /**
-     * Returns if the oplog entry is for a CRUD operation.
+     * Returns true if the oplog entry is for a CRUD operation.
      */
     static bool isCrudOpType(OpTypeEnum opType);
     bool isCrudOpType() const;
+
+    /**
+     * Returns true if the oplog entry is for a command related to indexes.
+     * i.e createIndexes, dropIndexes, startIndexBuild, commitIndexBuild, abortIndexBuild.
+     */
+    bool isIndexCommandType() const;
 
     /**
      * Returns if the operation should be prepared. Must be called on an 'applyOps' entry.

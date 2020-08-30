@@ -37,10 +37,13 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
+#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/database_version_gen.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/read_through_cache.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -57,6 +60,171 @@ static constexpr int kMaxNumStaleVersionRetries = 10;
  * will block skip the catalog cache refresh.
  */
 extern const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh;
+
+/**
+ * Constructed exclusively by the CatalogCache to be used as vector clock (Time) to drive
+ * DatabaseCache's refreshes.
+ *
+ * The DatabaseVersion class contains a UUID that is not comparable,
+ * in fact is impossible to compare two different DatabaseVersion that have different UUIDs.
+ *
+ * This class wrap a DatabaseVersion object to make it always comparable by timestamping it with a
+ * node-local sequence number (_dbVersionLocalSequence).
+ *
+ * This class class should go away once a cluster-wide comparable DatabaseVersion will be
+ * implemented.
+ */
+class ComparableDatabaseVersion {
+public:
+    /*
+     * Create a ComparableDatabaseVersion that wraps the given DatabaseVersion.
+     * Each object created through this method will have a local sequence number grater then the
+     * previously created ones.
+     */
+    static ComparableDatabaseVersion makeComparableDatabaseVersion(const DatabaseVersion& version);
+
+    /*
+     * Empty constructor needed by the ReadThroughCache.
+     *
+     * Instances created through this constructor will be always less then the ones created through
+     * the static constructor.
+     */
+    ComparableDatabaseVersion() = default;
+
+    const DatabaseVersion& getVersion() const;
+
+    uint64_t getLocalSequenceNum() const;
+
+    BSONObj toBSON() const;
+
+    std::string toString() const;
+
+    // Rerturns true if the two versions have the same UUID
+    bool sameUuid(const ComparableDatabaseVersion& other) const {
+        return _dbVersion.getUuid() == other._dbVersion.getUuid();
+    }
+
+    bool operator==(const ComparableDatabaseVersion& other) const {
+        return sameUuid(other) && (_dbVersion.getLastMod() == other._dbVersion.getLastMod());
+    }
+
+    bool operator!=(const ComparableDatabaseVersion& other) const {
+        return !(*this == other);
+    }
+
+    /*
+     * In the case the two compared instances have different UUIDs the most recently created one
+     * will be grater, otherwise the comparision will be driven by the lastMod field of the
+     * underlying DatabaseVersion.
+     */
+    bool operator<(const ComparableDatabaseVersion& other) const {
+        if (sameUuid(other)) {
+            return _dbVersion.getLastMod() < other._dbVersion.getLastMod();
+        } else {
+            return _localSequenceNum < other._localSequenceNum;
+        }
+    }
+
+    bool operator>(const ComparableDatabaseVersion& other) const {
+        return other < *this;
+    }
+
+    bool operator<=(const ComparableDatabaseVersion& other) const {
+        return !(*this > other);
+    }
+
+    bool operator>=(const ComparableDatabaseVersion& other) const {
+        return !(*this < other);
+    }
+
+private:
+    static AtomicWord<uint64_t> _localSequenceNumSource;
+
+    ComparableDatabaseVersion(const DatabaseVersion& version, uint64_t localSequenceNum)
+        : _dbVersion(version), _localSequenceNum(localSequenceNum) {}
+
+    DatabaseVersion _dbVersion;
+    // Locally incremented sequence number that allows to compare two database versions with
+    // different UUIDs. Each new comparableDatabaseVersion will have a greater sequence number then
+    // the ones created before.
+    uint64_t _localSequenceNum{0};
+};
+
+/**
+ * Constructed to be used exclusively by the CatalogCache as a vector clock (Time) to drive
+ * CollectionCache's lookups.
+ *
+ * The ChunkVersion class contains an non comparable epoch, which makes impossible to compare two
+ * ChunkVersions when their epochs's differ.
+ *
+ * This class wraps a ChunkVersion object with a node-local sequence number (_localSequenceNum) that
+ * allows the comparision.
+ *
+ * This class should go away once a cluster-wide comparable ChunkVersion is implemented.
+ */
+class ComparableChunkVersion {
+public:
+    static ComparableChunkVersion makeComparableChunkVersion(const ChunkVersion& version);
+
+    ComparableChunkVersion() = default;
+
+    const ChunkVersion& getVersion() const;
+
+    uint64_t getLocalSequenceNum() const;
+
+    BSONObj toBSON() const;
+
+    std::string toString() const;
+
+    bool sameEpoch(const ComparableChunkVersion& other) const {
+        return _chunkVersion.epoch() == other._chunkVersion.epoch();
+    }
+
+    bool operator==(const ComparableChunkVersion& other) const {
+        return sameEpoch(other) &&
+            (_chunkVersion.majorVersion() == other._chunkVersion.majorVersion() &&
+             _chunkVersion.minorVersion() == other._chunkVersion.minorVersion());
+    }
+
+    bool operator!=(const ComparableChunkVersion& other) const {
+        return !(*this == other);
+    }
+
+    bool operator<(const ComparableChunkVersion& other) const {
+        if (sameEpoch(other)) {
+            return _chunkVersion.majorVersion() < other._chunkVersion.majorVersion() ||
+                (_chunkVersion.majorVersion() == other._chunkVersion.majorVersion() &&
+                 _chunkVersion.minorVersion() < other._chunkVersion.minorVersion());
+        } else {
+            return _localSequenceNum < other._localSequenceNum;
+        }
+    }
+
+    bool operator>(const ComparableChunkVersion& other) const {
+        return other < *this;
+    }
+
+    bool operator<=(const ComparableChunkVersion& other) const {
+        return !(*this > other);
+    }
+
+    bool operator>=(const ComparableChunkVersion& other) const {
+        return !(*this < other);
+    }
+
+private:
+    static AtomicWord<uint64_t> _localSequenceNumSource;
+
+    ComparableChunkVersion(const ChunkVersion& version, uint64_t localSequenceNum)
+        : _chunkVersion(version), _localSequenceNum(localSequenceNum) {}
+
+    ChunkVersion _chunkVersion;
+
+    // Locally incremented sequence number that allows to compare two colection versions with
+    // different epochs. Each new comparableChunkVersion will have a greater sequence number than
+    // the ones created before.
+    uint64_t _localSequenceNum{0};
+};
 
 /**
  * Constructed exclusively by the CatalogCache, contains a reference to the cached information for
@@ -94,10 +262,10 @@ class CachedCollectionRoutingInfo {
 public:
     CachedDatabaseInfo db() const {
         return _db;
-    };
+    }
 
-    std::shared_ptr<ChunkManager> cm() const {
-        return _cm;
+    const ChunkManager* cm() const {
+        return _cm.get_ptr();
     }
 
 private:
@@ -106,16 +274,17 @@ private:
 
     CachedCollectionRoutingInfo(NamespaceString nss,
                                 CachedDatabaseInfo db,
-                                std::shared_ptr<ChunkManager> cm);
+                                boost::optional<ChunkManager> cm);
 
     NamespaceString _nss;
 
     // Copy of the database's cached info.
     CachedDatabaseInfo _db;
 
-    // Shared reference to the collection's cached chunk distribution if sharded, otherwise null.
-    // This is a shared reference rather than a copy because the chunk distribution can be large.
-    std::shared_ptr<ChunkManager> _cm;
+    // Shared reference to the collection's cached chunk distribution if sharded, otherwise
+    // boost::none. This is a shared reference rather than a copy because the chunk distribution can
+    // be large.
+    boost::optional<ChunkManager> _cm;
 };
 
 /**
@@ -128,7 +297,7 @@ class CatalogCache {
     CatalogCache& operator=(const CatalogCache&) = delete;
 
 public:
-    CatalogCache(CatalogCacheLoader& cacheLoader);
+    CatalogCache(ServiceContext* service, CatalogCacheLoader& cacheLoader);
     ~CatalogCache();
 
     /**
@@ -196,13 +365,15 @@ public:
         OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Non-blocking method that marks the current cached database entry as needing refresh if the
-     * entry's databaseVersion matches 'databaseVersion'.
+     * Advances the version in the cache for the given database.
      *
-     * To be called if routing by a copy of the cached database entry as of 'databaseVersion' caused
-     * a StaleDbVersion to be received.
+     * To be called with the wantedVersion returned by a targeted node in case of a
+     * StaleDatabaseVersion response.
+     *
+     * In the case the passed version is boost::none, nothing will be done.
      */
-    void onStaleDatabaseVersion(const StringData dbName, const DatabaseVersion& databaseVersion);
+    void onStaleDatabaseVersion(const StringData dbName,
+                                const boost::optional<DatabaseVersion>& wantedVersion);
 
     /**
      * Non-blocking method that marks the current cached collection entry as needing refresh if its
@@ -252,12 +423,6 @@ public:
     void checkEpochOrThrow(const NamespaceString& nss,
                            ChunkVersion targetCollectionVersion,
                            const ShardId& shardId) const;
-
-    /**
-     * Non-blocking method, which indiscriminately causes the database entry for the specified
-     * database to be refreshed the next time getDatabase is called.
-     */
-    void invalidateDatabaseEntry(const StringData dbName);
 
     /**
      * Non-blocking method, which invalidates the shard for the routing table for the specified
@@ -332,35 +497,28 @@ private:
         std::shared_ptr<RoutingTableHistory> routingInfo;
     };
 
-    /**
-     * Cache entry describing a database.
-     */
-    struct DatabaseInfoEntry {
-        // Specifies whether this cache entry needs a refresh (in which case 'dbt' will either be
-        // unset if the cache entry has never been loaded, or should not be relied on).
-        bool needsRefresh{true};
+    class DatabaseCache
+        : public ReadThroughCache<std::string, DatabaseType, ComparableDatabaseVersion> {
+    public:
+        DatabaseCache(ServiceContext* service,
+                      ThreadPoolInterface& threadPool,
+                      CatalogCacheLoader& catalogCacheLoader);
 
-        // Contains a notification to be waited on for the refresh to complete (only available if
-        // needsRefresh is true)
-        std::shared_ptr<Notification<Status>> refreshCompletionNotification;
+    private:
+        LookupResult _lookupDatabase(OperationContext* opCtx,
+                                     const std::string& dbName,
+                                     const ComparableDatabaseVersion& previousDbVersion);
 
-        // Contains the cached info about the database (only available if needsRefresh is false)
-        boost::optional<DatabaseType> dbt;
+        CatalogCacheLoader& _catalogCacheLoader;
+        Mutex _mutex = MONGO_MAKE_LATCH("DatabaseCache::_mutex");
     };
-
-    /**
-     * Non-blocking call which schedules an asynchronous refresh for the specified database. The
-     * database entry must be in the 'needsRefresh' state.
-     */
-    void _scheduleDatabaseRefresh(WithLock,
-                                  const std::string& dbName,
-                                  std::shared_ptr<DatabaseInfoEntry> dbEntry);
 
     /**
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
      * namespace must be in the 'needRefresh' state.
      */
     void _scheduleCollectionRefresh(WithLock,
+                                    ServiceContext* service,
                                     std::shared_ptr<CollectionRoutingInfoEntry> collEntry,
                                     NamespaceString const& nss,
                                     int refreshAttempt);
@@ -487,16 +645,16 @@ private:
 
     } _stats;
 
-    using DatabaseInfoMap = StringMap<std::shared_ptr<DatabaseInfoEntry>>;
+    std::shared_ptr<ThreadPool> _executor;
+
+
+    DatabaseCache _databaseCache;
+
+    // Mutex to serialize access to the collection cache
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("CatalogCache::_mutex");
+    // Map from full collection name to the routing info for that collection, grouped by database
     using CollectionInfoMap = StringMap<std::shared_ptr<CollectionRoutingInfoEntry>>;
     using CollectionsByDbMap = StringMap<CollectionInfoMap>;
-
-    // Mutex to serialize access to the structures below
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("CatalogCache::_mutex");
-
-    // Map from DB name to the info for that database
-    DatabaseInfoMap _databases;
-    // Map from full collection name to the routing info for that collection, grouped by database
     CollectionsByDbMap _collectionsByDb;
 };
 

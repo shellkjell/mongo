@@ -611,9 +611,9 @@ connection_runtime_config = [
         trigger application threads to perform eviction when the cache contains
         at least this many bytes of updates. It is a percentage of the cache size
         if the value is within the range of 1 to 100 or an absolute size when
-        greater than 100. Calculated as half of \c eviction_dirty_trigger by default.
+        greater than 100\. Calculated as half of \c eviction_dirty_trigger by default.
         The value is not allowed to exceed the \c cache_size. This setting only
-        alters behavior if it is lower than eviction_trigger''',
+        alters behavior if it is lower than \c eviction_trigger''',
         min=0, max='10TB'),
     Config('file_manager', '', r'''
         control how file handles are managed''',
@@ -722,9 +722,9 @@ connection_runtime_config = [
         intended for use with internal stress testing of WiredTiger.''',
         type='list', undoc=True,
         choices=[
-        'aggressive_sweep', 'checkpoint_slow', 'history_store_checkpoint_delay',
-        'history_store_sweep_race', 'split_1', 'split_2', 'split_3', 'split_4', 'split_5',
-        'split_6', 'split_7', 'split_8']),
+        'aggressive_sweep', 'backup_rename', 'checkpoint_slow', 'history_store_checkpoint_delay',
+        'history_store_sweep_race', 'prepare_checkpoint_delay', 'split_1', 'split_2',
+        'split_3', 'split_4', 'split_5', 'split_6', 'split_7', 'split_8']),
     Config('verbose', '', r'''
         enable messages for various events. Options are given as a
         list, such as <code>"verbose=[evictserver,read]"</code>''',
@@ -1016,6 +1016,18 @@ wiredtiger_open_common =\
         modified file is always flushed to storage when closing file handles to
         acquire exclusive access to the table''',
         type='boolean'),
+    Config('hash', '', r'''
+        manage resources around hash bucket arrays. All values must be a power of two.
+        Note that setting large values can significantly increase memory usage inside
+        WiredTiger''',
+        type='category', subconfig=[
+        Config('buckets', 512, r'''
+            configure the number of hash buckets for most system hash arrays''',
+            min='64', max='65536'),
+        Config('dhandle_buckets', 512, r'''
+            configure the number of hash buckets for hash arrays relating to data handles''',
+            min='64', max='65536'),
+        ]),
     Config('hazard_max', '1000', r'''
         maximum number of simultaneous hazard pointers per session
         handle''',
@@ -1450,11 +1462,11 @@ methods = {
     Config('name', '', r'''
         name of the transaction for tracing and debugging'''),
     Config('operation_timeout_ms', '0', r'''
-        when non-zero, a requested limit on the number of elapsed real time milliseconds taken
-        to complete database operations in this transaction.  Time is measured from the start
-        of each WiredTiger API call.  There is no guarantee any operation will not take longer
-        than this amount of time. If WiredTiger notices the limit has been exceeded, an operation
-        may return a WT_ROLLBACK error. Default is to have no limit''',
+        when non-zero, a requested limit on the time taken to complete operations in this
+        transaction. Time is measured in real time milliseconds from the start of each WiredTiger
+        API call. There is no guarantee any operation will not take longer than this amount of time.
+        If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
+        error. Default is to have no limit''',
         min=1),
     Config('priority', 0, r'''
         priority of the transaction for resolving conflicts.
@@ -1501,6 +1513,13 @@ methods = {
         current transaction.  The value must also not be older than the
         current stable timestamp.  See
         @ref transaction_timestamps'''),
+    Config('operation_timeout_ms', '0', r'''
+        when non-zero, a requested limit on the time taken to complete operations in this
+        transaction. Time is measured in real time milliseconds from the start of each WiredTiger
+        API call. There is no guarantee any operation will not take longer than this amount of time.
+        If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
+        error. Default is to have no limit''',
+        min=1),
     Config('sync', '', r'''
         override whether to sync log records when the transaction commits,
         inherited from ::wiredtiger_open \c transaction_sync.
@@ -1542,7 +1561,15 @@ methods = {
         for a transaction. See @ref transaction_timestamps'''),
 ]),
 
-'WT_SESSION.rollback_transaction' : Method([]),
+'WT_SESSION.rollback_transaction' : Method([
+    Config('operation_timeout_ms', '0', r'''
+        when non-zero, a requested limit on the time taken to complete operations in this
+        transaction. Time is measured in real time milliseconds from the start of each WiredTiger
+        API call. There is no guarantee any operation will not take longer than this amount of time.
+        If WiredTiger notices the limit has been exceeded, an operation may return a WT_ROLLBACK
+        error. Default is to have no limit''',
+        min=1),
+]),
 
 'WT_SESSION.checkpoint' : Method([
     Config('drop', '', r'''

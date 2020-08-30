@@ -34,6 +34,7 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/db/update/update_oplog_entry_version.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -223,7 +224,7 @@ write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry
 
     if (vField.ok() && vField.numberInt() == static_cast<int>(UpdateOplogEntryVersion::kDeltaV2)) {
         // Make sure there's a diff field.
-        BSONElement diff = oField["diff"];
+        BSONElement diff = oField[update_oplog_entry::kDiffObjectFieldName];
         uassert(4772601,
                 str::stream() << "Expected 'diff' field to be an object, instead got type: "
                               << diff.type(),
@@ -235,7 +236,7 @@ write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry
         // Treat it as a "classic" update which can either be a full replacement or a
         // modifier-style update. Which variant it is will be determined when the update driver is
         // constructed.
-        return UpdateModification(oField);
+        return UpdateModification(oField, ClassicTag{});
     }
 
     // The $v field must be present, but have some unsupported value.
@@ -261,7 +262,7 @@ write_ops::UpdateModification::UpdateModification(BSONElement update) {
     _update = PipelineUpdate{uassertStatusOK(AggregationRequest::parsePipelineFromBSON(update))};
 }
 
-write_ops::UpdateModification::UpdateModification(const BSONObj& update) {
+write_ops::UpdateModification::UpdateModification(const BSONObj& update, ClassicTag) {
     // Do a sanity check that the $v field is either not provided or has value of 1.
     const auto versionElem = update["$v"];
     uassert(4772602,
@@ -283,7 +284,7 @@ write_ops::UpdateModification write_ops::UpdateModification::parseFromBSON(BSONE
 
 write_ops::UpdateModification write_ops::UpdateModification::parseLegacyOpUpdateFromBSON(
     const BSONObj& obj) {
-    return UpdateModification(obj);
+    return UpdateModification(obj, ClassicTag{});
 }
 
 int write_ops::UpdateModification::objsize() const {

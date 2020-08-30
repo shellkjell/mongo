@@ -368,9 +368,9 @@ StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(
                               << ". Unrecognized field '" << fieldName
                               << "'. This command may be meant for a mongocryptd process.");
 
-            // TODO SERVER-47065: A 4.6 node still has to accept the '_use44SortKeys' field, since
-            // it could be included in a command sent from a 4.4 mongos. In 4.7 development, this
-            // code to tolerate the '_use44SortKeys' field can be deleted.
+            // TODO SERVER-47065: A 4.7+ node still has to accept the '_use44SortKeys' field, since
+            // it could be included in a command sent from a 4.4 mongos. When 5.0 becomes last-lts,
+            // this code to tolerate the '_use44SortKeys' field can be deleted.
         } else if (!isGenericArgument(fieldName)) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Failed to parse: " << cmdObj.toString() << ". "
@@ -658,10 +658,16 @@ StatusWith<int> QueryRequest::parseMaxTimeMS(BSONElement maxTimeMSElt) {
             (StringBuilder() << maxTimeMSElt.fieldNameStringData() << " must be a number").str());
     }
     long long maxTimeMSLongLong = maxTimeMSElt.safeNumberLong();  // returns 0 on EOO
-    if (maxTimeMSLongLong < 0 || maxTimeMSLongLong > INT_MAX) {
-        return StatusWith<int>(
-            ErrorCodes::BadValue,
-            (StringBuilder() << maxTimeMSElt.fieldNameStringData() << " is out of range").str());
+
+    const long long maxVal = maxTimeMSElt.fieldNameStringData() == kMaxTimeMSOpOnlyField
+        ? (long long)(INT_MAX) + kMaxTimeMSOpOnlyMaxPadding
+        : INT_MAX;
+    if (maxTimeMSLongLong < 0 || maxTimeMSLongLong > maxVal) {
+        return StatusWith<int>(ErrorCodes::BadValue,
+                               (StringBuilder()
+                                << maxTimeMSLongLong << " value for "
+                                << maxTimeMSElt.fieldNameStringData() << " is out of range")
+                                   .str());
     }
     double maxTimeMSDouble = maxTimeMSElt.numberDouble();
     if (maxTimeMSElt.type() == mongo::NumberDouble && floor(maxTimeMSDouble) != maxTimeMSDouble) {

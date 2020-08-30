@@ -74,6 +74,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/oplog_cap_maintainer_thread.h"
@@ -177,7 +178,7 @@ StatusWith<int> StorageInterfaceImpl::incrementRollbackID(OperationContext* opCt
 
     // We wait until durable so that we are sure the Rollback ID is updated before rollback ends.
     if (status.isOK()) {
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+        JournalFlusher::get(opCtx)->waitForJournalFlush();
         return newRBID;
     }
     return status;
@@ -303,9 +304,10 @@ namespace {
  * Returns NamespaceNotFound if the database or collection does not exist.
  */
 template <typename AutoGetCollectionType>
-StatusWith<Collection*> getCollection(const AutoGetCollectionType& autoGetCollection,
-                                      const NamespaceStringOrUUID& nsOrUUID,
-                                      const std::string& message) {
+StatusWith<decltype(std::declval<AutoGetCollectionType>().getCollection())> getCollection(
+    const AutoGetCollectionType& autoGetCollection,
+    const NamespaceStringOrUUID& nsOrUUID,
+    const std::string& message) {
     if (!autoGetCollection.getDb()) {
         StringData dbName = nsOrUUID.nss() ? nsOrUUID.nss()->db() : nsOrUUID.dbname();
         return {ErrorCodes::NamespaceNotFound,
@@ -488,6 +490,30 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         }
         wuow.commit();
 
+        return Status::OK();
+    });
+}
+
+Status StorageInterfaceImpl::createIndexesOnEmptyCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const std::vector<BSONObj>& secondaryIndexSpecs) {
+    return writeConflictRetry(opCtx, "createIndexesOnEmptyCollection", nss.ns(), [&] {
+        AutoGetCollection autoColl(opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
+        WriteUnitOfWork wunit(opCtx);
+
+        for (auto&& spec : secondaryIndexSpecs) {
+            // Will error if collection is not empty.
+            auto secIndexSW =
+                autoColl.getCollection()->getIndexCatalog()->createIndexOnEmptyCollection(opCtx,
+                                                                                          spec);
+            auto status = secIndexSW.getStatus();
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+
+        wunit.commit();
         return Status::OK();
     });
 }
@@ -950,7 +976,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         auto request = UpdateRequest();
         request.setNamespaceString(collection->ns());
         request.setQuery(query);
-        request.setUpdateModification(update);
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(update));
         request.setUpsert(true);
         invariant(!request.isMulti());  // This follows from using an exact _id query.
         invariant(!request.shouldReturnAnyDocs());
@@ -1000,7 +1027,8 @@ Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
     auto request = UpdateRequest();
     request.setNamespaceString(nss);
     request.setQuery({});
-    request.setUpdateModification(update.obj);
+    request.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(update.obj));
     request.setUpsert(true);
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1012,7 +1040,8 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
     auto request = UpdateRequest();
     request.setNamespaceString(nss);
     request.setQuery(query);
-    request.setUpdateModification(update.obj);
+    request.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(update.obj));
     invariant(!request.isUpsert());
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1252,7 +1281,10 @@ void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
 Timestamp StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
     auto serviceContext = opCtx->getServiceContext();
 
-    StorageControl::stopStorageControls(serviceContext);
+    // Pass an InterruptedDueToReplStateChange error to async callers waiting on the JournalFlusher
+    // thread for durability.
+    Status reason = Status(ErrorCodes::InterruptedDueToReplStateChange, "Rollback in progress.");
+    StorageControl::stopStorageControls(serviceContext, reason);
 
     auto swStableTimestamp = serviceContext->getStorageEngine()->recoverToStableTimestamp(opCtx);
     fassert(31049, swStableTimestamp);
@@ -1377,10 +1409,6 @@ boost::optional<Timestamp> StorageInterfaceImpl::getLastStableRecoveryTimestamp(
     }
 
     return ret;
-}
-
-bool StorageInterfaceImpl::supportsDocLocking(ServiceContext* serviceCtx) const {
-    return serviceCtx->getStorageEngine()->supportsDocLocking();
 }
 
 Timestamp StorageInterfaceImpl::getAllDurableTimestamp(ServiceContext* serviceCtx) const {

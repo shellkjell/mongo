@@ -62,6 +62,7 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -72,6 +73,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_util.h"
 #include "mongo/db/system_index.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -177,20 +179,24 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
             collection->init(opCtx);
     }
 
-    // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized yet,
-    // so no system.views collection would be found. Now that we're sufficiently initialized, reload
-    // the viewCatalog to populate its in-memory state. If there are problems with the catalog
-    // contents as might be caused by incorrect mongod versions or similar, they are found right
-    // away.
-    auto views = ViewCatalog::get(this);
-    Status reloadStatus = views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
-    if (!reloadStatus.isOK()) {
-        LOGV2_WARNING_OPTIONS(20326,
-                              {logv2::LogTag::kStartupWarnings},
-                              "Unable to parse views; remove any invalid views "
-                              "from the collection to restore server functionality",
-                              "error"_attr = redact(reloadStatus),
-                              "namespace"_attr = _viewsName);
+    // When in repair mode, record stores are not loaded. Thus the ViewsCatalog cannot be reloaded.
+    if (!storageGlobalParams.repair) {
+        // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized
+        // yet, so no system.views collection would be found. Now that we're sufficiently
+        // initialized, reload the viewCatalog to populate its in-memory state. If there are
+        // problems with the catalog contents as might be caused by incorrect mongod versions or
+        // similar, they are found right away.
+        auto views = ViewCatalog::get(this);
+        Status reloadStatus =
+            views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
+        if (!reloadStatus.isOK()) {
+            LOGV2_WARNING_OPTIONS(20326,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "Unable to parse views; remove any invalid views "
+                                  "from the collection to restore server functionality",
+                                  "error"_attr = redact(reloadStatus),
+                                  "namespace"_attr = _viewsName);
+        }
     }
 }
 
@@ -491,7 +497,8 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
           "namespace"_attr = nss,
           "uuid"_attr = uuid);
 
-    auto status = DurableCatalog::get(opCtx)->dropCollection(opCtx, collection->getCatalogId());
+    auto status = catalog::dropCollection(
+        opCtx, collection->ns(), collection->getCatalogId(), collection->getSharedIdent());
     if (!status.isOK())
         return status;
 
@@ -579,7 +586,6 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
             str::stream() << "Cannot create collection " << nss
                           << " - database is in the process of being dropped.",
             !_dropPending.load());
-    assertMovePrimaryInProgress(opCtx, nss);
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -593,6 +599,7 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
 
     NamespaceString viewOnNss(viewName.db(), options.viewOn);
     _checkCanCreateCollection(opCtx, viewName, options);
+
     audit::logCreateCollection(&cc(), viewName.toString());
 
     if (viewName.isOplog())
@@ -648,17 +655,23 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     // reserve oplog slots here if it is run outside of a multi-document transaction. Multi-
     // document transactions reserve the appropriate oplog slots at commit time.
     OplogSlot createOplogSlot;
-    if (canAcceptWrites && supportsDocLocking() && !coordinator->isOplogDisabledFor(opCtx, nss) &&
+    if (canAcceptWrites && !coordinator->isOplogDisabledFor(opCtx, nss) &&
         !opCtx->inMultiDocumentTransaction()) {
         createOplogSlot = repl::getNextOpTime(opCtx);
     }
 
-    if (MONGO_unlikely(hangAndFailAfterCreateCollectionReservesOpTime.shouldFail())) {
-        hangAndFailAfterCreateCollectionReservesOpTime.pauseWhileSet(opCtx);
-        uasserted(51267, "hangAndFailAfterCreateCollectionReservesOpTime fail point enabled");
-    }
+    hangAndFailAfterCreateCollectionReservesOpTime.executeIf(
+        [&](const BSONObj&) {
+            hangAndFailAfterCreateCollectionReservesOpTime.pauseWhileSet(opCtx);
+            uasserted(51267, "hangAndFailAfterCreateCollectionReservesOpTime fail point enabled");
+        },
+        [&](const BSONObj& data) {
+            auto fpNss = data["nss"].str();
+            return fpNss.empty() || fpNss == nss.toString();
+        });
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
+    assertMovePrimaryInProgress(opCtx, nss);
     audit::logCreateCollection(&cc(), nss.ns());
 
     LOGV2(20320,
@@ -676,7 +689,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         uassertStatusOK(storageEngine->getCatalog()->createCollection(
             opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
     auto catalogId = catalogIdRecordStorePair.first;
-    std::unique_ptr<Collection> ownedCollection =
+    std::shared_ptr<Collection> ownedCollection =
         Collection::Factory::get(opCtx)->make(opCtx,
                                               nss,
                                               catalogId,
@@ -862,16 +875,15 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         boost::intrusive_ptr<ExpressionContext> expCtx(
             new ExpressionContext(opCtx, std::move(collator), nss));
 
-        // Save this to a variable to avoid reading the atomic variable multiple times.
-        const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
         // If the feature compatibility version is not kLatest, and we are validating features as
         // master, ban the use of new agg features introduced in kLatest to prevent them from being
         // persisted in the catalog.
         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+        ServerGlobalParams::FeatureCompatibility::Version fcv;
         if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-            currentFCV != ServerGlobalParams::FeatureCompatibility::kLatest) {
-            expCtx->maxFeatureCompatibilityVersion = currentFCV;
+            serverGlobalParams.featureCompatibility.isLessThan(
+                ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
+            expCtx->maxFeatureCompatibilityVersion = fcv;
         }
 
         // The match expression parser needs to know that we're parsing an expression for a
@@ -917,6 +929,11 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
     }
 
     if (collectionOptions.isView()) {
+        if (nss.isSystem())
+            return Status(
+                ErrorCodes::InvalidNamespace,
+                "View name cannot start with 'system.', which is reserved for system namespaces");
+
         uassertStatusOK(createView(opCtx, nss, collectionOptions));
     } else {
         invariant(createCollection(opCtx, nss, collectionOptions, createDefaultIndexes, idIndex),

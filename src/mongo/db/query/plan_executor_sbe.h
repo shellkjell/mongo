@@ -43,6 +43,7 @@ public:
         OperationContext* opCtx,
         std::unique_ptr<CanonicalQuery> cq,
         std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> root,
+        const Collection* collection,
         NamespaceString nss,
         bool isOpen,
         boost::optional<std::queue<std::pair<BSONObj, boost::optional<RecordId>>>> stash,
@@ -107,8 +108,17 @@ public:
         return LockPolicy::kLocksInternally;
     }
 
-    bool isPipelineExecutor() const override {
-        return false;
+    // TODO: Support 'planSummary' for SBE.
+    std::string getPlanSummary() const override {
+        return "unsupported";
+    }
+
+    // TODO: Support collection of plan summary stats for SBE.
+    void getSummaryStats(PlanSummaryStats* statsOut) const override {}
+
+    // TODO: Support debug stats for SBE.
+    BSONObj getStats() const override {
+        return BSONObj{};
     }
 
 private:
@@ -120,11 +130,15 @@ private:
 
     NamespaceString _nss;
 
+    // CompileCtx owns the instance pointed by _env, so we must keep it around.
+    sbe::RuntimeEnvironment* _env{nullptr};
+    sbe::CompileCtx _ctx;
     std::unique_ptr<sbe::PlanStage> _root;
 
     sbe::value::SlotAccessor* _result{nullptr};
     sbe::value::SlotAccessor* _resultRecordId{nullptr};
     sbe::value::SlotAccessor* _oplogTs{nullptr};
+    boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
     bool _shouldTrackLatestOplogTimestamp{false};
     bool _shouldTrackResumeToken{false};
 

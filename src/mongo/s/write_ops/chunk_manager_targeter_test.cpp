@@ -50,7 +50,7 @@ auto buildUpdate(const NamespaceString& nss, BSONObj query, BSONObj update, bool
     write_ops::Update updateOp(nss);
     write_ops::UpdateOpEntry entry;
     entry.setQ(query);
-    entry.setU(update);
+    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
     entry.setUpsert(upsert);
     updateOp.setUpdates(std::vector{entry});
     return BatchedCommandRequest{std::move(updateOp)};
@@ -72,7 +72,7 @@ public:
             makeChunkManager(kNss, ShardKeyPattern(shardKeyPattern), nullptr, false, splitPoints);
         return ChunkManagerTargeter(operationContext(), kNss);
     }
-    std::shared_ptr<ChunkManager> chunkManager;
+    boost::optional<ChunkManager> chunkManager;
 };
 
 TEST_F(ChunkManagerTargeterTest, TargetInsertWithRangePrefixHashedShardKey) {

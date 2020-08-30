@@ -37,22 +37,25 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/cached_plan.h"
-#include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/count_scan.h"
+#include "mongo/db/exec/distinct_scan.h"
+#include "mongo/db/exec/idhack.h"
+#include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/near.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
+#include "mongo/db/exec/text.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/query/find_common.h"
 #include "mongo/db/query/mock_yield_policies.h"
+#include "mongo/db/query/plan_insert_listener.h"
 #include "mongo/db/query/plan_yield_policy_impl.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
@@ -71,16 +74,10 @@ using std::vector;
 const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime =
     OperationContext::declareDecoration<repl::OpTime>();
 
-struct CappedInsertNotifierData {
-    shared_ptr<CappedInsertNotifier> notifier;
-    uint64_t lastEOFVersion = ~0;
-};
-
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(planExecutorAlwaysFails);
 MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
-MONGO_FAIL_POINT_DEFINE(planExecutorHangWhileYieldedInWaitForInserts);
 
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
@@ -149,14 +146,11 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
 
-    // Both ChangeStreamProxy and CollectionScan stages can provide oplog tracking info, such as
-    // post batch resume token, or latest oplog timestamp. If either of these two stages is present
-    // in the execution tree, then cache it for fast retrieval of the oplog info, avoiding the need
-    // traverse the tree in runtime.
-    if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY)) {
-        _oplogTrackingStage = static_cast<ChangeStreamProxyStage*>(changeStreamProxy);
-    } else if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
-        _oplogTrackingStage = static_cast<CollectionScan*>(collectionScan);
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN stage.
+    // This is used for change streams in order to keep the the latest oplog timestamp and post
+    // batch resume token up to date as the oplog scan progresses.
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        _collScanStage = static_cast<CollectionScan*>(collectionScan);
     }
 
     // We may still need to initialize _nss from either collection or _cq.
@@ -302,7 +296,7 @@ void PlanExecutorImpl::reattachToOperationContext(OperationContext* opCtx) {
 
 PlanExecutor::ExecState PlanExecutorImpl::getNext(BSONObj* objOut, RecordId* dlOut) {
     const auto state = getNextDocument(&_docOutput, dlOut);
-    if (objOut) {
+    if (objOut && state == ExecState::ADVANCED) {
         const bool includeMetadata = _expCtx && _expCtx->needsMerge;
         *objOut = includeMetadata ? _docOutput.toBsonWithMetaData() : _docOutput.toBson();
     }
@@ -321,77 +315,6 @@ PlanExecutor::ExecState PlanExecutorImpl::getNextDocument(Document* objOut, Reco
     }
 
     return state;
-}
-
-bool PlanExecutorImpl::_shouldListenForInserts() {
-    return _cq && _cq->getQueryRequest().isTailableAndAwaitData() &&
-        awaitDataState(_opCtx).shouldWaitForInserts && _opCtx->checkForInterruptNoAssert().isOK() &&
-        awaitDataState(_opCtx).waitForInsertsDeadline >
-        _opCtx->getServiceContext()->getPreciseClockSource()->now();
-}
-
-bool PlanExecutorImpl::_shouldWaitForInserts() {
-    // If this is an awaitData-respecting operation and we have time left and we're not interrupted,
-    // we should wait for inserts.
-    if (_shouldListenForInserts()) {
-        // We expect awaitData cursors to be yielding.
-        invariant(_yieldPolicy->canReleaseLocksDuringExecution());
-
-        // For operations with a last committed opTime, we should not wait if the replication
-        // coordinator's lastCommittedOpTime has progressed past the client's lastCommittedOpTime.
-        // In that case, we will return early so that we can inform the client of the new
-        // lastCommittedOpTime immediately.
-        if (!clientsLastKnownCommittedOpTime(_opCtx).isNull()) {
-            auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-            return clientsLastKnownCommittedOpTime(_opCtx) >= replCoord->getLastCommittedOpTime();
-        }
-        return true;
-    }
-    return false;
-}
-
-std::shared_ptr<CappedInsertNotifier> PlanExecutorImpl::_getCappedInsertNotifier() {
-    // We don't expect to need a capped insert notifier for non-yielding plans.
-    invariant(_yieldPolicy->canReleaseLocksDuringExecution());
-
-    // We can only wait if we have a collection; otherwise we should retry immediately when
-    // we hit EOF.
-    dassert(_opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IS));
-    auto databaseHolder = DatabaseHolder::get(_opCtx);
-    auto db = databaseHolder->getDb(_opCtx, _nss.db());
-    invariant(db);
-    auto collection = CollectionCatalog::get(_opCtx).lookupCollectionByNamespace(_opCtx, _nss);
-    invariant(collection);
-
-    return collection->getCappedInsertNotifier();
-}
-
-void PlanExecutorImpl::_waitForInserts(CappedInsertNotifierData* notifierData) {
-    invariant(notifierData->notifier);
-
-    // The notifier wait() method will not wait unless the version passed to it matches the
-    // current version of the notifier.  Since the version passed to it is the current version
-    // of the notifier at the time of the previous EOF, we require two EOFs in a row with no
-    // notifier version change in order to wait.  This is sufficient to ensure we never wait
-    // when data is available.
-    auto curOp = CurOp::get(_opCtx);
-    curOp->pauseTimer();
-    ON_BLOCK_EXIT([curOp] { curOp->resumeTimer(); });
-    auto opCtx = _opCtx;
-    uint64_t currentNotifierVersion = notifierData->notifier->getVersion();
-    auto yieldResult = _yieldPolicy->yieldOrInterrupt(opCtx, [opCtx, notifierData] {
-        const auto deadline = awaitDataState(opCtx).waitForInsertsDeadline;
-        notifierData->notifier->waitUntil(notifierData->lastEOFVersion, deadline);
-        if (MONGO_unlikely(planExecutorHangWhileYieldedInWaitForInserts.shouldFail())) {
-            LOGV2(4452903,
-                  "PlanExecutor - planExecutorHangWhileYieldedInWaitForInserts fail point enabled. "
-                  "Blocking until fail point is disabled");
-            planExecutorHangWhileYieldedInWaitForInserts.pauseWhileSet();
-        }
-    });
-    notifierData->lastEOFVersion = currentNotifierVersion;
-
-    uassertStatusOK(yieldResult);
 }
 
 PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* objOut,
@@ -419,10 +342,11 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
     // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
     // insert notifier the entire time we are in the loop.  Holding a shared pointer to the capped
     // insert notifier is necessary for the notifierVersion to advance.
-    CappedInsertNotifierData cappedInsertNotifierData;
-    if (_shouldListenForInserts()) {
+    insert_listener::CappedInsertNotifierData cappedInsertNotifierData;
+    if (insert_listener::shouldListenForInserts(_opCtx, _cq.get())) {
         // We always construct the CappedInsertNotifier for awaitData cursors.
-        cappedInsertNotifierData.notifier = _getCappedInsertNotifier();
+        cappedInsertNotifierData.notifier =
+            insert_listener::getCappedInsertNotifier(_opCtx, _nss, _yieldPolicy.get());
     }
     for (;;) {
         // These are the conditions which can cause us to yield:
@@ -516,10 +440,13 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                       "enabled. Blocking until fail point is disabled");
                 planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
             }
-            if (!_shouldWaitForInserts()) {
+
+            if (!insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
                 return PlanExecutor::IS_EOF;
             }
-            _waitForInserts(&cappedInsertNotifierData);
+
+            insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), &cappedInsertNotifierData);
+
             // There may be more results, keep going.
             continue;
         }
@@ -544,7 +471,6 @@ void PlanExecutorImpl::dispose(OperationContext* opCtx) {
         return;
     }
 
-    _root->dispose(opCtx);
     _currentState = kDisposed;
 }
 
@@ -582,41 +508,15 @@ bool PlanExecutorImpl::isDisposed() const {
 }
 
 Timestamp PlanExecutorImpl::getLatestOplogTimestamp() const {
-    if (!_oplogTrackingStage) {
-        return {};
-    }
-
-    const auto stageType = _oplogTrackingStage->stageType();
-    if (stageType == STAGE_COLLSCAN) {
-        return static_cast<const CollectionScan*>(_oplogTrackingStage)->getLatestOplogTimestamp();
-    } else {
-        invariant(stageType == STAGE_CHANGE_STREAM_PROXY);
-        return static_cast<const ChangeStreamProxyStage*>(_oplogTrackingStage)
-            ->getLatestOplogTimestamp();
-    }
+    return _collScanStage ? _collScanStage->getLatestOplogTimestamp() : Timestamp{};
 }
 
 BSONObj PlanExecutorImpl::getPostBatchResumeToken() const {
     static const BSONObj kEmptyPBRT;
-    if (!_oplogTrackingStage) {
-        return kEmptyPBRT;
-    }
-
-    const auto stageType = _oplogTrackingStage->stageType();
-    if (stageType == STAGE_COLLSCAN) {
-        return static_cast<const CollectionScan*>(_oplogTrackingStage)->getPostBatchResumeToken();
-    } else {
-        invariant(stageType == STAGE_CHANGE_STREAM_PROXY);
-        return static_cast<const ChangeStreamProxyStage*>(_oplogTrackingStage)
-            ->getPostBatchResumeToken();
-    }
+    return _collScanStage ? _collScanStage->getPostBatchResumeToken() : kEmptyPBRT;
 }
 
 PlanExecutor::LockPolicy PlanExecutorImpl::lockPolicy() const {
-    if (isPipelineExecutor()) {
-        return LockPolicy::kLocksInternally;
-    }
-
     // If this PlanExecutor is simply unspooling queued data, then there is no need to acquire
     // locks.
     if (_root->stageType() == StageType::STAGE_QUEUED_DATA) {
@@ -626,8 +526,100 @@ PlanExecutor::LockPolicy PlanExecutorImpl::lockPolicy() const {
     return LockPolicy::kLockExternally;
 }
 
-bool PlanExecutorImpl::isPipelineExecutor() const {
-    return _root->stageType() == StageType::STAGE_PIPELINE_PROXY ||
-        _root->stageType() == StageType::STAGE_CHANGE_STREAM_PROXY;
+std::string PlanExecutorImpl::getPlanSummary() const {
+    return Explain::getPlanSummary(_root.get());
+}
+
+void PlanExecutorImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
+    invariant(statsOut);
+
+    // We can get some of the fields we need from the common stats stored in the
+    // root stage of the plan tree.
+    const CommonStats* common = _root->getCommonStats();
+    statsOut->nReturned = common->advanced;
+
+    // The other fields are aggregations over the stages in the plan tree. We flatten
+    // the tree into a list and then compute these aggregations.
+    std::vector<const PlanStage*> stages;
+    Explain::flattenExecTree(_root.get(), &stages);
+
+    statsOut->totalKeysExamined = 0;
+    statsOut->totalDocsExamined = 0;
+
+    for (size_t i = 0; i < stages.size(); i++) {
+        statsOut->totalKeysExamined +=
+            Explain::getKeysExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
+        statsOut->totalDocsExamined +=
+            Explain::getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
+
+        if (isSortStageType(stages[i]->stageType())) {
+            statsOut->hasSortStage = true;
+
+            auto sortStage = static_cast<const SortStage*>(stages[i]);
+            auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
+            statsOut->usedDisk = sortStats->wasDiskUsed;
+        }
+
+        if (STAGE_IXSCAN == stages[i]->stageType()) {
+            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
+            const IndexScanStats* ixscanStats =
+                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+            statsOut->indexesUsed.insert(ixscanStats->indexName);
+        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
+            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
+            const CountScanStats* countScanStats =
+                static_cast<const CountScanStats*>(countScan->getSpecificStats());
+            statsOut->indexesUsed.insert(countScanStats->indexName);
+        } else if (STAGE_IDHACK == stages[i]->stageType()) {
+            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
+            const IDHackStats* idHackStats =
+                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
+            statsOut->indexesUsed.insert(idHackStats->indexName);
+        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
+            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
+            const DistinctScanStats* distinctScanStats =
+                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
+            statsOut->indexesUsed.insert(distinctScanStats->indexName);
+        } else if (STAGE_TEXT == stages[i]->stageType()) {
+            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
+            const TextStats* textStats =
+                static_cast<const TextStats*>(textStage->getSpecificStats());
+            statsOut->indexesUsed.insert(textStats->indexName);
+        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
+                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
+            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
+            const NearStats* nearStats =
+                static_cast<const NearStats*>(nearStage->getSpecificStats());
+            statsOut->indexesUsed.insert(nearStats->indexName);
+        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
+            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
+            const CachedPlanStats* cachedStats =
+                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
+            statsOut->replanReason = cachedStats->replanReason;
+        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
+            statsOut->fromMultiPlanner = true;
+        } else if (STAGE_COLLSCAN == stages[i]->stageType()) {
+            statsOut->collectionScans++;
+            const auto collScan = static_cast<const CollectionScan*>(stages[i]);
+            const auto collScanStats =
+                static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
+            if (!collScanStats->tailable)
+                statsOut->collectionScansNonTailable++;
+        }
+    }
+}
+
+BSONObj PlanExecutorImpl::getStats() const {
+    // Serialize all stats from the winning plan.
+    auto mps = getMultiPlanStage();
+    auto winningPlanStats =
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()]) : _root->getStats();
+    return Explain::statsToBSON(*winningPlanStats);
+}
+
+MultiPlanStage* PlanExecutorImpl::getMultiPlanStage() const {
+    PlanStage* ps = getStageByType(_root.get(), StageType::STAGE_MULTI_PLAN);
+    invariant(ps == nullptr || ps->stageType() == StageType::STAGE_MULTI_PLAN);
+    return static_cast<MultiPlanStage*>(ps);
 }
 }  // namespace mongo

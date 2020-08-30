@@ -2,6 +2,7 @@
 
 import SCons
 
+from site_scons.mongo import insort_wrapper
 import libdeps
 import json
 
@@ -19,7 +20,6 @@ pcreSuffix = "-8.42"
 mozjsSuffix = '-60'
 yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
-gperftoolsSuffix = '-2.7'
 timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
 variantSuffix = '-1.4.0'
@@ -190,11 +190,11 @@ if not use_system_version_of_library('kms-message'):
 
 if use_system_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'SYSLIBDEPS' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
+        'SYSLIBDEPS_PRIVATE' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
     }
 elif use_vendored_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'SYSLIBDEPS' : ['lzma'],
+        'SYSLIBDEPS_PRIVATE' : ['lzma'],
     }
 
 def injectThirdParty(thisEnv, libraries=[], parts=[]):
@@ -229,15 +229,17 @@ for builder_name in ('Program', 'SharedLibrary', 'LoadableModule', 'StaticLibrar
         # OverrideEnvironment, since if you didn't pass any kw args
         # into your builder call, you just reuse the env you were
         # called with. That could mean that we see the same
-        # envirnoment here multiple times. But that is really OK,
+        # environment here multiple times. But that is really OK,
         # since the operation we are performing would be performed on
         # all of them anyway. The flag serves as a way to disable the
         # auto-injection for the handful of libraries where we must do
         # so to avoid forming a cycle.
         if not env.get('DISABLE_ALLOCATOR_SHIM_INJECTION', False):
             lds = env.get('LIBDEPS', [])
-            lds.append('$BUILD_DIR/third_party/shim_allocator')
-            env['LIBDEPS'] = lds
+            shim_allocator = '$BUILD_DIR/third_party/shim_allocator'
+            if shim_allocator not in lds:
+                insort_wrapper(lds, shim_allocator)
+                env['LIBDEPS'] = lds
 
         return target, source
 
@@ -363,11 +365,11 @@ else:
     boostEnv.SConscript(boostDirectory + '/SConscript', exports={ 'env' : boostEnv })
     boostEnv = boostEnv.Clone(
         LIBDEPS_INTERFACE=[
-            boostDirectory + '/boost_program_options',
             boostDirectory + '/boost_filesystem',
-            boostDirectory + '/boost_system',
             boostDirectory + '/boost_iostreams',
             boostDirectory + '/boost_log',
+            boostDirectory + '/boost_program_options',
+            boostDirectory + '/boost_system',
         ])
 
 boostEnv.Library(
@@ -529,11 +531,11 @@ if gperftoolsEnv['MONGO_ALLOCATOR'] in ["tcmalloc", "tcmalloc-experimental"]:
                 thirdPartyEnvironmentModifications['gperftools'][k] = v
         gperftoolsEnv.AddMethod(registerConsumerModifications, 'RegisterConsumerModifications')
         gperftoolsEnv.SConscript(
-            'gperftools' + gperftoolsSuffix + '/SConscript',
+            'gperftools' + '/SConscript',
             exports={'env' : gperftoolsEnv})
         gperftoolsEnv = gperftoolsEnv.Clone(
             LIBDEPS_INTERFACE=[
-                'gperftools' + gperftoolsSuffix + '/tcmalloc_minimal',
+                'gperftools/tcmalloc_minimal',
             ])
 
 gperftoolsEnv.Library(
@@ -542,6 +544,16 @@ gperftoolsEnv.Library(
         "shim_allocator.cpp",
     ],
     DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+    LIBDEPS_TAGS=[
+        # The shim allocator must be linked to every node, including what would
+        # be considered a leaf node to ensure the system allocator
+        # is not linked in before tcmalloc. This tag allows nodes tagged as
+        # leaf nodes to still get the correct allocator.
+        'lint-leaf-node-allowed-dep',
+        # This tag allows the allocator to be linked to nodes marked as not
+        # allowed to have public dependencies.
+        'lint-public-dep-allowed'
+    ],
 )
 
 

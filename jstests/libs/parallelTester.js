@@ -195,6 +195,10 @@ if (typeof _threadInject != "undefined") {
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
 
+            // These tests check global command counters.
+            "find_and_modify_metrics.js",
+            "update_metrics.js",
+
             // Views tests
             "views/invalid_system_views.js",      // Puts invalid view definitions in system.views.
             "views/views_all_commands.js",        // Drops test DB.
@@ -207,6 +211,12 @@ if (typeof _threadInject != "undefined") {
             // This test causes collMod commands to hang, which interferes with other tests running
             // collMod.
             "crud_ops_do_not_throw_locktimeout.js",
+
+            // Can fail if isMaster takes too long on a loaded machine.
+            "dbadmin.js",
+
+            // Other tests will fail while the requireApiVersion server parameter is set.
+            "require_api_version.js",
         ]);
 
         // The following tests cannot run when shell readMode is legacy.
@@ -214,8 +224,10 @@ if (typeof _threadInject != "undefined") {
             var requires_find_command = [
                 "apply_ops_system_dot_views.js",
                 "explode_for_sort_collation.js",
+                "explode_for_sort_fetch.js",
                 "update_pipeline_shell_helpers.js",
                 "update_with_pipeline.js",
+                "verify_update_mods.js",
                 "views/dbref_projection.js",
                 "views/views_aggregation.js",
                 "views/views_change.js",

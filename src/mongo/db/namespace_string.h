@@ -107,7 +107,7 @@ public:
     static const NamespaceString kMigrationCoordinatorsNamespace;
 
     // Namespace for storing the persisted state of tenant migration donors.
-    static const NamespaceString kMigrationDonorsNamespace;
+    static const NamespaceString kTenantMigrationDonorsNamespace;
 
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
@@ -117,6 +117,9 @@ public:
 
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
+
+    // Namespace for resharding operation state.
+    static const NamespaceString kConfigReshardingOperationsNamespace;
 
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
@@ -278,6 +281,16 @@ public:
      * never be marked as anything other than UNSHARDED.
      */
     bool isNamespaceAlwaysUnsharded() const;
+
+    /**
+     * Returns whether the specified namespace is config.cache.chunks.<>.
+     */
+    bool isConfigDotCacheDotChunks() const;
+
+    /**
+     * Returns whether the specified namespace is <database>.system.resharding.<>.
+     */
+    bool isTemporaryReshardingCollection() const;
 
     /**
      * Returns whether a namespace is replicated, based only on its string value. One notable

@@ -25,7 +25,7 @@
  *   does_not_support_stepdowns,
  *   requires_majority_read_concern,
  *   requires_profiling,
- *   uses_transactions,
+ *   uses_transactions
  * ]
  */
 (function() {
@@ -33,7 +33,7 @@
 
 load('jstests/libs/profiler.js');
 load("jstests/libs/logv2_helpers.js");
-load('jstests/sharding/libs/last_stable_mongod_commands.js');
+load('jstests/sharding/libs/last_lts_mongod_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -96,10 +96,12 @@ let testCases = {
     _configsvrRemoveShard: {skip: "internal command"},
     _configsvrRemoveShardFromZone: {skip: "internal command"},
     _configsvrRenameCollection: {skip: "internal command"},
+    _configsvrReshardCollection: {skip: "internal command"},
     _configsvrShardCollection: {skip: "internal command"},
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
     _flushRoutingTableCacheUpdates: {skip: "internal command"},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "internal command"},
     _getNextSessionMods: {skip: "internal command"},
     _getUserCacheGeneration: {skip: "internal command"},
     _hashBSONElement: {skip: "internal command"},
@@ -116,6 +118,7 @@ let testCases = {
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
+    _vectorClockPersist: {skip: "internal command"},
     abortTransaction: {
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
@@ -453,6 +456,7 @@ let testCases = {
         useLogs: true,
     },
     handshake: {skip: "does not accept read or write concern"},
+    hello: {skip: "does not accept read or write concern"},
     hostInfo: {skip: "does not accept read or write concern"},
     httpClientRequest: {skip: "does not accept read or write concern"},
     insert: {
@@ -465,7 +469,6 @@ let testCases = {
     },
     internalRenameIfOptionsAndIndexesMatch: {skip: "internal command"},
     invalidateUserCache: {skip: "does not accept read or write concern"},
-    isMaster: {skip: "does not accept read or write concern"},
     isdbgrid: {skip: "does not accept read or write concern"},
     killAllSessions: {skip: "does not accept read or write concern"},
     killAllSessionsByPattern: {skip: "does not accept read or write concern"},
@@ -500,6 +503,7 @@ let testCases = {
     profile: {skip: "does not accept read or write concern"},
     reIndex: {skip: "does not accept read or write concern"},
     reapLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
+    recipientSyncData: {skip: "does not accept read or write concern"},
     refineCollectionShardKey: {skip: "does not accept read or write concern"},
     refreshLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
     refreshSessions: {skip: "does not accept read or write concern"},
@@ -613,6 +617,11 @@ let testCases = {
     startRecordingTraffic: {skip: "does not accept read or write concern"},
     startSession: {skip: "does not accept read or write concern"},
     stopRecordingTraffic: {skip: "does not accept read or write concern"},
+    testDeprecation: {skip: "does not accept read or write concern"},
+    testDeprecationInVersion2: {skip: "does not accept read or write concern"},
+    testRemoval: {skip: "does not accept read or write concern"},
+    testVersions1And2: {skip: "does not accept read or write concern"},
+    testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
     unsetSharding: {skip: "internal command"},
     update: {

@@ -31,8 +31,10 @@
 
 #include <vector>
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
+#include "mongo/db/repl/tenant_migration_shared_data.h"
 
 namespace mongo {
 namespace repl {
@@ -53,11 +55,12 @@ public:
     };
 
     TenantDatabaseCloner(const std::string& dbName,
-                         InitialSyncSharedData* sharedData,
+                         TenantMigrationSharedData* sharedData,
                          const HostAndPort& source,
                          DBClientConnection* client,
                          StorageInterface* storageInterface,
-                         ThreadPool* dbPool);
+                         ThreadPool* dbPool,
+                         StringData tenantId);
 
     virtual ~TenantDatabaseCloner() = default;
 
@@ -65,14 +68,19 @@ public:
 
     std::string toString() const;
 
+    Timestamp getOperationTime_forTest();
+
 protected:
     ClonerStages getStages() final;
 
     bool isMyFailPoint(const BSONObj& data) const final;
 
+    TenantMigrationSharedData* getSharedData() const override {
+        return checked_cast<TenantMigrationSharedData*>(BaseCloner::getSharedData());
+    }
+
 private:
-    // TODO(SERVER-48816): implement unit tests
-    // friend class TenantDatabaseclonerTest;
+    friend class TenantDatabaseClonerTest;
 
     class TenantDatabaseClonerStage : public ClonerStage<TenantDatabaseCloner> {
     public:
@@ -121,6 +129,12 @@ private:
     std::unique_ptr<TenantCollectionCloner> _currentCollectionCloner;         // (MX)
 
     TenantDatabaseClonerStage _listCollectionsStage;  // (R)
+
+    // The database name prefix of the tenant associated with this migration.
+    std::string _tenantId;  // (R)
+
+    // The operationTime returned with the listCollections result.
+    Timestamp _operationTime;  // (X)
 
     Stats _stats;  // (MX)
 };

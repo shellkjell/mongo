@@ -57,6 +57,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -240,11 +241,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         }
     }
     const Date_t now = _replExecutor->now();
-    Milliseconds networkTime(0);
+    Microseconds networkTime(0);
     StatusWith<ReplSetHeartbeatResponse> hbStatusResponse(hbResponse);
 
     if (responseStatus.isOK()) {
-        networkTime = cbData.response.elapsedMillis.value_or(Milliseconds{0});
+        networkTime = cbData.response.elapsed.value_or(Microseconds{0});
         // TODO(sz) Because the term is duplicated in ReplSetMetaData, we can get rid of this
         // and update tests.
         const auto& hbResponse = hbStatusResponse.getValue();
@@ -269,8 +270,9 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         hbStatusResponse = StatusWith<ReplSetHeartbeatResponse>(responseStatus);
     }
 
-    HeartbeatResponseAction action =
-        _topCoord->processHeartbeatResponse(now, networkTime, target, hbStatusResponse);
+    // Leaving networkTime units as ms since the average ping calulation may be affected.
+    HeartbeatResponseAction action = _topCoord->processHeartbeatResponse(
+        now, duration_cast<Milliseconds>(networkTime), target, hbStatusResponse);
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
@@ -302,8 +304,8 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
                 // binaries to have on-disk repl config with 'newlyAdded' fields.
                 invariant(
                     _supportsAutomaticReconfig() ||
-                    serverGlobalParams.featureCompatibility.getVersion() >
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44);
+                    serverGlobalParams.featureCompatibility.isGreaterThan(
+                        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44));
 
                 const auto memId = mem->getId();
                 auto status = _replExecutor->scheduleWork(
@@ -509,6 +511,7 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     lk.unlock();
 
     yieldLocksForPreparedTransactions(opCtx.get());
+    invalidateSessionsForStepdown(opCtx.get());
 
     lk.lock();
 
@@ -660,7 +663,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
         auto status = _externalState->storeLocalConfigDocument(
             opCtx.get(), newConfig.toBSON(), false /* writeOplog */);
         // Wait for durability of the new config document.
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
+        JournalFlusher::get(opCtx.get())->waitForJournalFlush();
 
         bool isFirstConfig;
         {
@@ -785,6 +788,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
             lk.unlock();
 
             yieldLocksForPreparedTransactions(opCtx.get());
+            invalidateSessionsForStepdown(opCtx.get());
 
             lk.lock();
 

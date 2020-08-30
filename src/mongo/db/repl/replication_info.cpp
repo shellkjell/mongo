@@ -33,6 +33,7 @@
 #include <list>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
@@ -79,6 +80,12 @@ using std::unique_ptr;
 
 namespace repl {
 namespace {
+
+constexpr auto kHelloString = "hello"_sd;
+// Aliases for the hello command in order to provide backwards compatibility.
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
 /**
  * Appends replication-related fields to the isMaster response. Returns the topology version that
  * was included in the response.
@@ -86,6 +93,7 @@ namespace {
 TopologyVersion appendReplicationInfo(OperationContext* opCtx,
                                       BSONObjBuilder& result,
                                       bool appendReplicationProcess,
+                                      bool useLegacyResponseFields,
                                       boost::optional<TopologyVersion> clientTopologyVersion,
                                       boost::optional<long long> maxAwaitTimeMS) {
     TopologyVersion topologyVersion;
@@ -100,7 +108,7 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         }
         auto isMasterResponse =
             replCoord->awaitIsMasterResponse(opCtx, horizonParams, clientTopologyVersion, deadline);
-        result.appendElements(isMasterResponse->toBSON());
+        result.appendElements(isMasterResponse->toBSON(useLegacyResponseFields));
         if (appendReplicationProcess) {
             replCoord->appendSlaveInfoData(&result);
         }
@@ -134,9 +142,8 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
 
-    result.appendBool("ismaster",
+    result.appendBool((useLegacyResponseFields ? "ismaster" : "isWritablePrimary"),
                       ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
-
 
     BSONObjBuilder topologyVersionBuilder(result.subobjStart("topologyVersion"));
     currentTopologyVersion.serialize(&topologyVersionBuilder);
@@ -161,9 +168,12 @@ public:
         bool appendReplicationProcess = configElement.numberInt() > 0;
 
         BSONObjBuilder result;
+        // TODO SERVER-50219: Change useLegacyResponseFields to false once the serverStatus changes
+        // to remove master-slave terminology are merged.
         appendReplicationInfo(opCtx,
                               result,
                               appendReplicationProcess,
+                              true /* useLegacyResponseFields */,
                               boost::none /* clientTopologyVersion */,
                               boost::none /* maxAwaitTimeMS */);
 
@@ -221,9 +231,15 @@ public:
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster final : public BasicCommandWithReplyBuilderInterface {
+class CmdHello final : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdIsMaster() : BasicCommandWithReplyBuilderInterface("isMaster", "ismaster") {}
+    CmdHello()
+        : BasicCommandWithReplyBuilderInterface(
+              kHelloString, {kCamelCaseIsMasterString, kLowerCaseIsMasterString}) {}
+
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     bool requiresAuth() const final {
         return false;
@@ -260,6 +276,11 @@ public:
         if (cmdObj["forShell"].trueValue()) {
             LastError::get(opCtx->getClient()).disable();
         }
+
+        // Parse the command name, which should be one of the following: hello, isMaster, or
+        // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+        // instead of "ismaster" and "secondaryDelaySecs" response field instead of "slaveDelay".
+        bool useLegacyResponseFields = (cmdObj.firstElementFieldNameStringData() != kHelloString);
 
         transport::Session::TagMask sessionTagsToSet = 0;
         transport::Session::TagMask sessionTagsToUnset = 0;
@@ -304,6 +325,7 @@ public:
         auto internalClientElement = cmdObj["internalClient"];
         if (internalClientElement) {
             sessionTagsToSet |= transport::Session::kInternalClient;
+            sessionTagsToUnset |= transport::Session::kExternalClientKeepOpen;
 
             uassert(ErrorCodes::TypeMismatch,
                     str::stream() << "'internalClient' must be of type Object, but was of type "
@@ -328,7 +350,7 @@ public:
                     // All incoming connections from mongod/mongos of earlier versions should be
                     // closed if the featureCompatibilityVersion is bumped to 3.6.
                     if (elem.numberInt() >=
-                        WireSpec::instance().incomingInternalClient.maxWireVersion) {
+                        WireSpec::instance().get()->incomingInternalClient.maxWireVersion) {
                         sessionTagsToSet |=
                             transport::Session::kLatestVersionInternalClientKeepOpen;
                     } else {
@@ -403,8 +425,8 @@ public:
         }
 
         auto result = replyBuilder->getBodyBuilder();
-        auto currentTopologyVersion =
-            appendReplicationInfo(opCtx, result, 0, clientTopologyVersion, maxAwaitTimeMS);
+        auto currentTopologyVersion = appendReplicationInfo(
+            opCtx, result, 0, useLegacyResponseFields, clientTopologyVersion, maxAwaitTimeMS);
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             const int configServerModeNumber = 2;
@@ -418,16 +440,12 @@ public:
         result.append("logicalSessionTimeoutMinutes", localLogicalSessionTimeoutMinutes);
         result.appendNumber("connectionId", opCtx->getClient()->getConnectionId());
 
-        if (internalClientElement) {
-            result.append("minWireVersion",
-                          WireSpec::instance().incomingInternalClient.minWireVersion);
-            result.append("maxWireVersion",
-                          WireSpec::instance().incomingInternalClient.maxWireVersion);
+        if (auto wireSpec = WireSpec::instance().get(); internalClientElement) {
+            result.append("minWireVersion", wireSpec->incomingInternalClient.minWireVersion);
+            result.append("maxWireVersion", wireSpec->incomingInternalClient.maxWireVersion);
         } else {
-            result.append("minWireVersion",
-                          WireSpec::instance().incomingExternalClient.minWireVersion);
-            result.append("maxWireVersion",
-                          WireSpec::instance().incomingExternalClient.maxWireVersion);
+            result.append("minWireVersion", wireSpec->incomingExternalClient.minWireVersion);
+            result.append("maxWireVersion", wireSpec->incomingExternalClient.maxWireVersion);
         }
 
         result.append("readOnly", storageGlobalParams.readOnly);
@@ -480,7 +498,7 @@ public:
 
         return true;
     }
-} cmdismaster;
+} cmdhello;
 
 OpCounterServerStatusSection replOpCounterServerStatusSection("opcountersRepl", &replOpCounters);
 

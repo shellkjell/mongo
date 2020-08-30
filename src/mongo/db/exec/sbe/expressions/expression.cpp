@@ -31,6 +31,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 
+#include <iomanip>
 #include <sstream>
 
 #include "mongo/db/exec/sbe/stages/spool.h"
@@ -76,7 +77,7 @@ std::unique_ptr<vm::CodeFragment> EConstant::compile(CompileCtx& ctx) const {
 std::vector<DebugPrinter::Block> EConstant::debugPrint() const {
     std::vector<DebugPrinter::Block> ret;
     std::stringstream ss;
-    value::printValue(ss, _tag, _val);
+    ss << std::make_pair(_tag, _val);
 
     ret.emplace_back(ss.str());
 
@@ -345,6 +346,9 @@ struct BuiltinFn {
  * The map of recognized builtin functions.
  */
 static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
+    {"dateParts", BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::dateParts, false}},
+    {"datePartsWeekYear",
+     BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::datePartsWeekYear, false}},
     {"split", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::split, false}},
     {"regexMatch", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::regexMatch, false}},
     {"dropFields", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::dropFields, false}},
@@ -354,6 +358,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"abs", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::abs, false}},
     {"addToArray", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToArray, true}},
     {"addToSet", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToSet, true}},
+    {"doubleDoubleSum",
+     BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::doubleDoubleSum, true}},
 };
 
 /**
@@ -376,6 +382,8 @@ struct InstrFn {
 static stdx::unordered_map<std::string, InstrFn> kInstrFunctions = {
     {"getField",
      InstrFn{[](size_t n) { return n == 2; }, &vm::CodeFragment::appendGetField, false}},
+    {"getElement",
+     InstrFn{[](size_t n) { return n == 2; }, &vm::CodeFragment::appendGetElement, false}},
     {"fillEmpty",
      InstrFn{[](size_t n) { return n == 2; }, &vm::CodeFragment::appendFillEmpty, false}},
     {"exists", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendExists, false}},
@@ -392,6 +400,7 @@ static stdx::unordered_map<std::string, InstrFn> kInstrFunctions = {
     {"max", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMax, true}},
     {"first", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendFirst, true}},
     {"last", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendLast, true}},
+    {"mod", InstrFn{[](size_t n) { return n == 2; }, &vm::CodeFragment::appendMod, false}},
 };
 }  // namespace
 
@@ -606,6 +615,167 @@ std::vector<DebugPrinter::Block> EFail::debugPrint() const {
     return ret;
 }
 
+std::unique_ptr<EExpression> ENumericConvert::clone() const {
+    return std::make_unique<ENumericConvert>(_nodes[0]->clone(), _target);
+}
+
+std::unique_ptr<vm::CodeFragment> ENumericConvert::compile(CompileCtx& ctx) const {
+    auto code = std::make_unique<vm::CodeFragment>();
+
+    auto operand = _nodes[0]->compile(ctx);
+    code->append(std::move(operand));
+    code->appendNumericConvert(_target);
+
+    return code;
+}
+
+std::vector<DebugPrinter::Block> ENumericConvert::debugPrint() const {
+    std::vector<DebugPrinter::Block> ret;
+
+    DebugPrinter::addKeyword(ret, "convert");
+
+    ret.emplace_back("(");
+
+    DebugPrinter::addBlocks(ret, _nodes[0]->debugPrint());
+
+    ret.emplace_back(DebugPrinter::Block("`,"));
+
+    switch (_target) {
+        case value::TypeTags::NumberInt32:
+            ret.emplace_back("int32");
+            break;
+        case value::TypeTags::NumberInt64:
+            ret.emplace_back("int64");
+            break;
+        case value::TypeTags::NumberDouble:
+            ret.emplace_back("double");
+            break;
+        case value::TypeTags::NumberDecimal:
+            ret.emplace_back("decimal");
+            break;
+        default:
+            MONGO_UNREACHABLE;
+            break;
+    }
+
+    ret.emplace_back("`)");
+    return ret;
+}
+
+std::unique_ptr<EExpression> ETypeMatch::clone() const {
+    return std::make_unique<ETypeMatch>(_nodes[0]->clone(), _typeMask);
+}
+
+std::unique_ptr<vm::CodeFragment> ETypeMatch::compile(CompileCtx& ctx) const {
+    auto code = std::make_unique<vm::CodeFragment>();
+
+    auto variable = _nodes[0]->compile(ctx);
+    code->append(std::move(variable));
+    code->appendTypeMatch(_typeMask);
+
+    return code;
+}
+
+std::vector<DebugPrinter::Block> ETypeMatch::debugPrint() const {
+    std::vector<DebugPrinter::Block> ret;
+
+    DebugPrinter::addKeyword(ret, "typeMatch");
+
+    ret.emplace_back("(`");
+
+    DebugPrinter::addBlocks(ret, _nodes[0]->debugPrint());
+    ret.emplace_back(DebugPrinter::Block("`,"));
+    std::stringstream ss;
+    ss << "0x" << std::setfill('0') << std::uppercase << std::setw(8) << std::hex << _typeMask;
+    ret.emplace_back(ss.str());
+
+    ret.emplace_back("`)");
+
+    return ret;
+}
+
+RuntimeEnvironment::RuntimeEnvironment(const RuntimeEnvironment& other)
+    : _state{other._state}, _isSmp{other._isSmp} {
+    for (auto&& [type, slot] : _state->slots) {
+        emplaceAccessor(slot.first, slot.second);
+    }
+}
+
+RuntimeEnvironment::~RuntimeEnvironment() {
+    if (_state.use_count() == 1) {
+        for (size_t idx = 0; idx < _state->vals.size(); ++idx) {
+            if (_state->owned[idx]) {
+                releaseValue(_state->typeTags[idx], _state->vals[idx]);
+            }
+        }
+    }
+}
+
+value::SlotId RuntimeEnvironment::registerSlot(StringData type,
+                                               value::TypeTags tag,
+                                               value::Value val,
+                                               bool owned,
+                                               value::SlotIdGenerator* slotIdGenerator) {
+    if (auto it = _state->slots.find(type); it == _state->slots.end()) {
+        invariant(slotIdGenerator);
+        auto slot = slotIdGenerator->generate();
+        emplaceAccessor(slot, _state->pushSlot(type, slot));
+        _accessors.at(slot).reset(owned, tag, val);
+        return slot;
+    }
+
+    uasserted(4946303, str::stream() << "slot already registered:" << type);
+}
+
+value::SlotId RuntimeEnvironment::getSlot(StringData type) {
+    if (auto it = _state->slots.find(type); it != _state->slots.end()) {
+        return it->second.first;
+    }
+
+    uasserted(4946305, str::stream() << "environment slot is not registered for type: " << type);
+}
+
+void RuntimeEnvironment::resetSlot(value::SlotId slot,
+                                   value::TypeTags tag,
+                                   value::Value val,
+                                   bool owned) {
+    // With intra-query parallelism enabled the global environment can hold only read-only values.
+    invariant(!_isSmp);
+
+    if (auto it = _accessors.find(slot); it != _accessors.end()) {
+        it->second.reset(owned, tag, val);
+        return;
+    }
+
+    uasserted(4946300, str::stream() << "undefined slot accessor:" << slot);
+}
+
+value::SlotAccessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
+    if (auto it = _accessors.find(slot); it != _accessors.end()) {
+        return &it->second;
+    }
+
+    uasserted(4946301, str::stream() << "undefined slot accessor:" << slot);
+}
+
+std::unique_ptr<RuntimeEnvironment> RuntimeEnvironment::makeCopy(bool isSmp) {
+    // Once this environment is used to create a copy for a parallel plan execution, it becomes
+    // a parallel environment itself.
+    if (isSmp) {
+        _isSmp = isSmp;
+    }
+
+    return std::unique_ptr<RuntimeEnvironment>(new RuntimeEnvironment(*this));
+}
+
+void RuntimeEnvironment::debugString(StringBuilder* builder) {
+    *builder << "env: { ";
+    for (auto&& [type, slot] : _state->slots) {
+        *builder << type << "=s" << slot.first << " ";
+    }
+    *builder << "}";
+}
+
 value::SlotAccessor* CompileCtx::getAccessor(value::SlotId slot) {
     for (auto it = correlated.rbegin(); it != correlated.rend(); ++it) {
         if (it->first == slot) {
@@ -613,7 +783,7 @@ value::SlotAccessor* CompileCtx::getAccessor(value::SlotId slot) {
         }
     }
 
-    uasserted(4822848, str::stream() << "undefined slot accessor:" << slot);
+    return env->getAccessor(slot);
 }
 
 std::shared_ptr<SpoolBuffer> CompileCtx::getSpoolBuffer(SpoolId spool) {
@@ -629,6 +799,10 @@ void CompileCtx::pushCorrelated(value::SlotId slot, value::SlotAccessor* accesso
 
 void CompileCtx::popCorrelated() {
     correlated.pop_back();
+}
+
+CompileCtx CompileCtx::makeCopy(bool isSmp) {
+    return {env->makeCopy(isSmp)};
 }
 }  // namespace sbe
 }  // namespace mongo
